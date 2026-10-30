@@ -1,0 +1,878 @@
+package evaluation
+
+import (
+	"context"
+	"fmt"
+	"hash/crc32"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	errs "go.flipt.io/flipt/errors"
+	environments "go.flipt.io/flipt/internal/server/environments"
+	"go.flipt.io/flipt/internal/server/metrics"
+	"go.flipt.io/flipt/internal/server/tracing"
+	"go.flipt.io/flipt/internal/storage"
+	flipt "go.flipt.io/flipt/rpc/flipt"
+	"go.flipt.io/flipt/rpc/flipt/core"
+	rpcevaluation "go.flipt.io/flipt/rpc/flipt/evaluation"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
+)
+
+// addEvaluationEvent adds a tracing event for flag evaluation with the appropriate attributes
+func (s *Server) addEvaluationEvent(ctx context.Context, env environments.Environment, namespaceKey, flagKey, entityID, requestID string, attrs ...attribute.KeyValue) {
+	span := trace.SpanFromContext(ctx)
+	// pre-allocate to exact capacity needed
+	capacity := 3 + len(attrs)
+	if entityID != "" {
+		capacity++
+	}
+	if requestID != "" {
+		capacity++
+	}
+
+	baseAttrs := make([]attribute.KeyValue, 0, capacity)
+	baseAttrs = append(
+		baseAttrs,
+		tracing.AttributeEnvironment.String(env.Key()),
+		tracing.AttributeNamespace.String(namespaceKey),
+		tracing.AttributeFlag.String(flagKey),
+	)
+
+	if entityID != "" {
+		baseAttrs = append(baseAttrs, tracing.AttributeEntityID.String(entityID))
+	}
+	if requestID != "" {
+		baseAttrs = append(baseAttrs, tracing.AttributeRequestID.String(requestID))
+	}
+
+	baseAttrs = append(baseAttrs, attrs...)
+	span.AddEvent(tracing.Event, trace.WithAttributes(baseAttrs...))
+}
+
+// Variant evaluates a request for a multi-variate flag and entity.
+func (s *Server) Variant(ctx context.Context, r *rpcevaluation.EvaluationRequest) (*rpcevaluation.VariantEvaluationResponse, error) {
+	env, err := ResolveEnvironment(ctx, s.store, r.EnvironmentKey)
+	if err != nil {
+		return nil, err
+	}
+
+	store, err := env.EvaluationStore()
+	if err != nil {
+		return nil, err
+	}
+
+	flag, err := store.GetFlag(ctx, storage.NewResource(r.NamespaceKey, r.FlagKey, storage.WithReference(r.Reference)))
+	if err != nil {
+		return nil, err
+	}
+
+	if flag.Type != core.FlagType_VARIANT_FLAG_TYPE {
+		return nil, errs.ErrInvalidf("flag type %s invalid", flag.Type)
+	}
+
+	resp, err := s.variant(ctx, store, env, flag, r)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.tracingEnabled {
+		s.addEvaluationEvent(
+			ctx, env, r.NamespaceKey, r.FlagKey, r.EntityId, r.RequestId,
+			tracing.AttributeMatch.Bool(resp.Match),
+			tracing.AttributeVariant.String(resp.VariantKey),
+			tracing.AttributeReason.String(tracing.ReasonToValue(resp.Reason)),
+			tracing.AttributeSegments.StringSlice(resp.SegmentKeys),
+			tracing.AttributeFlagTypeVariant,
+		)
+	}
+
+	return resp, nil
+}
+
+func (s *Server) variant(ctx context.Context, store storage.ReadOnlyStore, env environments.Environment, flag *core.Flag, r *rpcevaluation.EvaluationRequest) (*rpcevaluation.VariantEvaluationResponse, error) {
+	var (
+		resp = &rpcevaluation.VariantEvaluationResponse{
+			FlagKey:   flag.Key,
+			RequestId: r.RequestId,
+		}
+		err      error
+		lastRank int32
+	)
+	if s.metricsEnabled {
+		var (
+			startTime       = time.Now().UTC()
+			environmentAttr = metrics.AttributeEnvironment.String(env.Key())
+			namespaceAttr   = metrics.AttributeNamespace.String(r.NamespaceKey)
+			flagAttr        = metrics.AttributeFlag.String(r.FlagKey)
+			baseMetricSet   = attribute.NewSet(environmentAttr, flagAttr, namespaceAttr)
+		)
+		metrics.EvaluationsTotal.Add(ctx, 1, metric.WithAttributeSet(baseMetricSet))
+
+		defer func() {
+			if err == nil {
+				metrics.EvaluationResultsTotal.Add(
+					ctx, 1,
+					metric.WithAttributeSet(
+						attribute.NewSet(
+							environmentAttr,
+							flagAttr,
+							metrics.AttributeFlagType.String("variant"),
+							metrics.AttributeMatch.Bool(resp.Match),
+							namespaceAttr,
+							metrics.AttributeReason.String(resp.Reason.String()),
+							metrics.AttributeSegments.StringSlice(resp.SegmentKeys),
+							metrics.AttributeValue.String(resp.VariantKey),
+						),
+					),
+				)
+			} else {
+				metrics.EvaluationErrorsTotal.Add(ctx, 1, metric.WithAttributeSet(baseMetricSet))
+			}
+
+			metrics.EvaluationLatency.Record(
+				ctx,
+				float64(time.Since(startTime).Nanoseconds())/1e6,
+				metric.WithAttributeSet(baseMetricSet),
+			)
+		}()
+	}
+
+	if flag.DefaultVariant != nil {
+		dv, ok := getVariant(flag.GetDefaultVariant(), flag.Variants...)
+		if !ok {
+			return nil, fmt.Errorf("default variant not found: %q", flag.GetDefaultVariant())
+		}
+
+		var attachment string
+		if dv.Attachment != nil {
+			a, err := dv.Attachment.MarshalJSON()
+			if err != nil {
+				return nil, err
+			}
+
+			attachment = string(a)
+		}
+
+		resp.Reason = rpcevaluation.EvaluationReason_DEFAULT_EVALUATION_REASON
+		resp.VariantKey = dv.Key
+		resp.VariantAttachment = attachment
+	}
+
+	if !flag.Enabled {
+		resp.Match = false
+		resp.Reason = rpcevaluation.EvaluationReason_FLAG_DISABLED_EVALUATION_REASON
+		return resp, nil
+	}
+
+	rules, err := store.GetEvaluationRules(ctx, storage.NewResource(r.NamespaceKey, r.FlagKey))
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rules) == 0 {
+		s.logger.Debug("no rules match")
+		return resp, nil
+	}
+
+	var (
+		matched        bool
+		reason         string
+		segmentMatches int
+	)
+	// rule loop
+	for _, rule := range rules {
+		if rule.Rank < lastRank {
+			return resp, errs.ErrInvalidf("rule rank: %d detected out of order", rule.Rank)
+		}
+
+		lastRank = rule.Rank
+
+		var segmentKeys []string
+		segmentMatches = 0
+
+		for k, v := range rule.Segments {
+			matched, reason, err = s.matchConstraints(r.Context, v.Constraints, v.MatchType, r.EntityId)
+			if err != nil {
+				return resp, err
+			}
+
+			if matched {
+				s.logger.Debug(reason)
+				segmentKeys = append(segmentKeys, k)
+				segmentMatches++
+			}
+		}
+
+		switch rule.SegmentOperator {
+		case core.SegmentOperator_OR_SEGMENT_OPERATOR:
+			if segmentMatches < 1 {
+				s.logger.Debug("did not match ANY segments")
+				continue
+			}
+		case core.SegmentOperator_AND_SEGMENT_OPERATOR:
+			if len(rule.Segments) != segmentMatches {
+				s.logger.Debug("did not match ALL segments")
+				continue
+			}
+		}
+
+		if len(segmentKeys) > 0 {
+			resp.SegmentKeys = segmentKeys
+		}
+
+		var distributions []*storage.EvaluationDistribution
+		distributions, err = store.GetEvaluationDistributions(ctx, storage.NewResource(r.NamespaceKey, r.FlagKey), storage.NewID(rule.ID))
+		if err != nil {
+			return resp, err
+		}
+
+		var validDistributions []*storage.EvaluationDistribution
+
+		for _, d := range distributions {
+			if d.Rollout > 0 {
+				validDistributions = append(validDistributions, d)
+			}
+		}
+
+		if len(validDistributions) == 0 {
+			s.logger.Debug("no distributions for rule")
+			resp.Match = true
+			resp.Reason = rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON
+			return resp, nil
+		}
+
+		var (
+			buckets           = make([]int, 0, len(validDistributions))
+			cumulativeRollout float32
+		)
+
+		totalRollout := float32(0)
+		for _, d := range validDistributions {
+			totalRollout += d.Rollout
+		}
+
+		for idx, d := range validDistributions {
+			normalizedRollout := (d.Rollout / totalRollout) * 100
+			cumulativeRollout += normalizedRollout
+			bucket := int(cumulativeRollout * percentMultiplier)
+			if idx+1 == len(validDistributions) {
+				bucket = int(totalBucketNum)
+			}
+			buckets = append(buckets, bucket)
+		}
+
+		var (
+			bucket = crc32Num(r.EntityId, r.FlagKey)
+			// sort.SearchInts searches for x in a sorted slice of ints and returns the index
+			// as specified by Search. The return value is the index to insert x if x is
+			// not present (it could be len(a)).
+			index = sort.SearchInts(buckets, int(bucket)+1)
+		)
+
+		// if index is outside of our existing buckets then it does not match any distribution
+		if index == len(validDistributions) {
+			s.logger.Debug("did not match any distributions")
+			resp.Match = false
+			return resp, nil
+		}
+
+		d := validDistributions[index]
+		s.logger.Debug("matched distribution", zap.Reflect("evaluation_distribution", d))
+
+		resp.Match = true
+		resp.VariantKey = d.VariantKey
+		resp.VariantAttachment = d.VariantAttachment
+		resp.Reason = rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON
+		return resp, nil
+	} // end rule loop
+
+	return resp, nil
+}
+
+// Boolean evaluates a request for a boolean flag and entity.
+func (s *Server) Boolean(ctx context.Context, r *rpcevaluation.EvaluationRequest) (*rpcevaluation.BooleanEvaluationResponse, error) {
+	env, err := ResolveEnvironment(ctx, s.store, r.EnvironmentKey)
+	if err != nil {
+		return nil, err
+	}
+
+	store, err := env.EvaluationStore()
+	if err != nil {
+		return nil, err
+	}
+
+	flag, err := store.GetFlag(ctx, storage.NewResource(r.NamespaceKey, r.FlagKey, storage.WithReference(r.Reference)))
+	if err != nil {
+		return nil, err
+	}
+
+	if flag.Type != core.FlagType_BOOLEAN_FLAG_TYPE {
+		return nil, errs.ErrInvalidf("flag type %s invalid", flag.Type)
+	}
+
+	resp, err := s.boolean(ctx, store, env, flag, r)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.tracingEnabled {
+		s.addEvaluationEvent(
+			ctx, env, r.NamespaceKey, r.FlagKey, r.EntityId, r.RequestId,
+			tracing.AttributeMatch.Bool(resp.Reason == rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON),
+			tracing.AttributeVariant.Bool(resp.Enabled),
+			tracing.AttributeReason.String(tracing.ReasonToValue(resp.Reason)),
+			tracing.AttributeSegments.StringSlice(resp.SegmentKeys),
+			tracing.AttributeFlagTypeBoolean,
+		)
+	}
+
+	return resp, nil
+}
+
+func (s *Server) boolean(ctx context.Context, store storage.ReadOnlyStore, env environments.Environment, flag *core.Flag, r *rpcevaluation.EvaluationRequest) (*rpcevaluation.BooleanEvaluationResponse, error) {
+	rollouts, err := store.GetEvaluationRollouts(ctx, storage.NewResource(r.NamespaceKey, flag.Key, storage.WithReference(r.Reference)))
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		resp = &rpcevaluation.BooleanEvaluationResponse{
+			FlagKey:   flag.Key,
+			RequestId: r.RequestId,
+		}
+		lastRank int32
+	)
+
+	if s.metricsEnabled {
+		var (
+			startTime       = time.Now().UTC()
+			environmentAttr = metrics.AttributeEnvironment.String(env.Key())
+			namespaceAttr   = metrics.AttributeNamespace.String(r.NamespaceKey)
+			flagAttr        = metrics.AttributeFlag.String(r.FlagKey)
+		)
+
+		baseMetricSet := attribute.NewSet(environmentAttr, flagAttr, namespaceAttr)
+
+		metrics.EvaluationsTotal.Add(ctx, 1, metric.WithAttributeSet(baseMetricSet))
+
+		defer func() {
+			if err == nil {
+				metrics.EvaluationResultsTotal.Add(
+					ctx, 1,
+					metric.WithAttributeSet(
+						attribute.NewSet(
+							environmentAttr,
+							flagAttr,
+							metrics.AttributeFlagType.String("boolean"),
+							namespaceAttr,
+							metrics.AttributeReason.String(resp.Reason.String()),
+							metrics.AttributeSegments.StringSlice(resp.SegmentKeys),
+							metrics.AttributeValue.Bool(resp.Enabled),
+						),
+					),
+				)
+			} else {
+				metrics.EvaluationErrorsTotal.Add(ctx, 1, metric.WithAttributeSet(baseMetricSet))
+			}
+
+			metrics.EvaluationLatency.Record(
+				ctx,
+				float64(time.Since(startTime).Nanoseconds())/1e6,
+				metric.WithAttributeSet(baseMetricSet),
+			)
+		}()
+	}
+
+	if !flag.Enabled && len(rollouts) == 0 {
+		resp.Reason = rpcevaluation.EvaluationReason_FLAG_DISABLED_EVALUATION_REASON
+		return resp, nil
+	}
+
+	for _, rollout := range rollouts {
+		if rollout.Rank < lastRank {
+			return nil, fmt.Errorf("rollout rank: %d detected out of order", rollout.Rank)
+		}
+
+		lastRank = rollout.Rank
+
+		if rollout.Threshold != nil {
+			// consistent hashing based on the entity id and flag key.
+			hash := crc32.ChecksumIEEE([]byte(r.EntityId + r.FlagKey))
+
+			normalizedValue := float32(int(hash) % 100)
+
+			// if this case does not hold, fall through to the next rollout.
+			if normalizedValue < rollout.Threshold.Percentage {
+				resp.Enabled = rollout.Threshold.Value
+				resp.Reason = rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON
+				s.logger.Debug("threshold based matched", zap.Int("rank", int(rollout.Rank)), zap.String("rollout_type", "threshold"))
+				return resp, nil
+			}
+		} else if rollout.Segment != nil {
+
+			var (
+				matched        bool
+				reason         string
+				segmentKeys    []string
+				segmentMatches = 0
+			)
+
+			for k, v := range rollout.Segment.Segments {
+				matched, reason, err = s.matchConstraints(r.Context, v.Constraints, v.MatchType, r.EntityId)
+				if err != nil {
+					return nil, err
+				}
+
+				// if we don't match the segment, fall through to the next rollout.
+				if matched {
+					s.logger.Debug(reason)
+					segmentKeys = append(segmentKeys, k)
+					segmentMatches++
+				}
+			}
+
+			switch rollout.Segment.SegmentOperator {
+			case core.SegmentOperator_OR_SEGMENT_OPERATOR:
+				if segmentMatches < 1 {
+					s.logger.Debug("did not match ANY segments")
+					continue
+				}
+			case core.SegmentOperator_AND_SEGMENT_OPERATOR:
+				if len(rollout.Segment.Segments) != segmentMatches {
+					s.logger.Debug("did not match ALL segments")
+					continue
+				}
+			}
+
+			resp.Enabled = rollout.Segment.Value
+			resp.Reason = rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON
+			resp.SegmentKeys = segmentKeys
+
+			s.logger.Debug("segment based matched", zap.Int("rank", int(rollout.Rank)), zap.Strings("segments", segmentKeys))
+			return resp, nil
+		}
+	}
+
+	// If we have exhausted all rollouts and we still don't have a match, return flag enabled value.
+	resp.Reason = rpcevaluation.EvaluationReason_DEFAULT_EVALUATION_REASON
+	resp.Enabled = flag.Enabled
+
+	s.logger.Debug("default rollout matched", zap.Bool("enabled", flag.Enabled))
+	return resp, nil
+}
+
+// Batch takes in a list of *evaluation.EvaluationRequest and returns their respective responses.
+func (s *Server) Batch(ctx context.Context, b *rpcevaluation.BatchEvaluationRequest) (*rpcevaluation.BatchEvaluationResponse, error) {
+	resp := &rpcevaluation.BatchEvaluationResponse{
+		Responses: make([]*rpcevaluation.EvaluationResponse, 0, len(b.Requests)),
+	}
+
+	for _, req := range b.GetRequests() {
+		// this is not ideal as it could lead to a lot of swapping the environment store if requests are coming in for different environments
+		// we will need to document that while you CAN use different environments in the same request, it is not recommended and could have a performance impact
+		// but since we are using an in-memory map it's probably not that bad
+		env, err := ResolveEnvironment(ctx, s.store, req.EnvironmentKey)
+		if err != nil {
+			return nil, err
+		}
+
+		store, err := env.EvaluationStore()
+		if err != nil {
+			return nil, err
+		}
+
+		f, err := store.GetFlag(ctx, storage.NewResource(req.NamespaceKey, req.FlagKey, storage.WithReference(b.Reference)))
+		if err != nil {
+			reason := rpcevaluation.ErrorEvaluationReason_NOT_FOUND_ERROR_EVALUATION_REASON
+			if !errs.AsMatch[errs.ErrNotFound](err) {
+				reason = rpcevaluation.ErrorEvaluationReason_UNKNOWN_ERROR_EVALUATION_REASON
+				s.logger.Debug("failed to get flag", zap.String("env", env.Key()), zap.String("ns", req.NamespaceKey), zap.String("flag", req.FlagKey), zap.Error(err))
+			}
+
+			eresp := &rpcevaluation.EvaluationResponse{
+				Type: rpcevaluation.EvaluationResponseType_ERROR_EVALUATION_RESPONSE_TYPE,
+				Response: &rpcevaluation.EvaluationResponse_ErrorResponse{
+					ErrorResponse: &rpcevaluation.ErrorEvaluationResponse{
+						FlagKey:      req.FlagKey,
+						NamespaceKey: req.NamespaceKey,
+						Reason:       reason,
+					},
+				},
+			}
+
+			resp.Responses = append(resp.Responses, eresp)
+			continue
+		}
+
+		var eresp *rpcevaluation.EvaluationResponse
+
+		switch f.Type {
+		case core.FlagType_BOOLEAN_FLAG_TYPE:
+			res, err := s.boolean(ctx, store, env, f, req)
+			if err != nil {
+				s.logger.Debug("failed to evaluate boolean flag", zap.String("env", env.Key()), zap.String("ns", req.NamespaceKey), zap.String("flag", req.FlagKey), zap.Error(err))
+				eresp = &rpcevaluation.EvaluationResponse{
+					Type: rpcevaluation.EvaluationResponseType_ERROR_EVALUATION_RESPONSE_TYPE,
+					Response: &rpcevaluation.EvaluationResponse_ErrorResponse{
+						ErrorResponse: &rpcevaluation.ErrorEvaluationResponse{
+							FlagKey:      req.FlagKey,
+							NamespaceKey: req.NamespaceKey,
+							Reason:       rpcevaluation.ErrorEvaluationReason_UNKNOWN_ERROR_EVALUATION_REASON,
+						},
+					},
+				}
+				resp.Responses = append(resp.Responses, eresp)
+				continue
+			}
+
+			if s.tracingEnabled {
+				s.addEvaluationEvent(
+					ctx, env, req.NamespaceKey, req.FlagKey, req.EntityId, req.RequestId,
+					tracing.AttributeMatch.Bool(res.Reason == rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON),
+					tracing.AttributeVariant.Bool(res.Enabled),
+					tracing.AttributeReason.String(tracing.ReasonToValue(res.Reason)),
+					tracing.AttributeSegments.StringSlice(res.SegmentKeys),
+					tracing.AttributeFlagTypeBoolean,
+				)
+			}
+
+			eresp = &rpcevaluation.EvaluationResponse{
+				Type: rpcevaluation.EvaluationResponseType_BOOLEAN_EVALUATION_RESPONSE_TYPE,
+				Response: &rpcevaluation.EvaluationResponse_BooleanResponse{
+					BooleanResponse: res,
+				},
+			}
+
+			resp.Responses = append(resp.Responses, eresp)
+		case core.FlagType_VARIANT_FLAG_TYPE:
+			res, err := s.variant(ctx, store, env, f, req)
+			if err != nil {
+				s.logger.Debug("failed to evaluate variant flag", zap.String("env", env.Key()), zap.String("ns", req.NamespaceKey), zap.String("flag", req.FlagKey), zap.Error(err))
+				eresp = &rpcevaluation.EvaluationResponse{
+					Type: rpcevaluation.EvaluationResponseType_ERROR_EVALUATION_RESPONSE_TYPE,
+					Response: &rpcevaluation.EvaluationResponse_ErrorResponse{
+						ErrorResponse: &rpcevaluation.ErrorEvaluationResponse{
+							FlagKey:      req.FlagKey,
+							NamespaceKey: req.NamespaceKey,
+							Reason:       rpcevaluation.ErrorEvaluationReason_UNKNOWN_ERROR_EVALUATION_REASON,
+						},
+					},
+				}
+				resp.Responses = append(resp.Responses, eresp)
+				continue
+			}
+
+			if s.tracingEnabled {
+				s.addEvaluationEvent(
+					ctx, env, req.NamespaceKey, req.FlagKey, req.EntityId, req.RequestId,
+					tracing.AttributeMatch.Bool(res.Match),
+					tracing.AttributeVariant.String(res.VariantKey),
+					tracing.AttributeReason.String(tracing.ReasonToValue(res.Reason)),
+					tracing.AttributeSegments.StringSlice(res.SegmentKeys),
+					tracing.AttributeFlagTypeVariant,
+				)
+			}
+			eresp = &rpcevaluation.EvaluationResponse{
+				Type: rpcevaluation.EvaluationResponseType_VARIANT_EVALUATION_RESPONSE_TYPE,
+				Response: &rpcevaluation.EvaluationResponse_VariantResponse{
+					VariantResponse: res,
+				},
+			}
+
+			resp.Responses = append(resp.Responses, eresp)
+		default:
+			s.logger.Debug("unexpected flag type", zap.String("env", env.Key()), zap.String("ns", req.NamespaceKey), zap.String("flag", req.FlagKey), zap.Stringer("type", f.Type))
+			eresp = &rpcevaluation.EvaluationResponse{
+				Type: rpcevaluation.EvaluationResponseType_ERROR_EVALUATION_RESPONSE_TYPE,
+				Response: &rpcevaluation.EvaluationResponse_ErrorResponse{
+					ErrorResponse: &rpcevaluation.ErrorEvaluationResponse{
+						FlagKey:      req.FlagKey,
+						NamespaceKey: req.NamespaceKey,
+						Reason:       rpcevaluation.ErrorEvaluationReason_UNKNOWN_ERROR_EVALUATION_REASON,
+					},
+				},
+			}
+			resp.Responses = append(resp.Responses, eresp)
+			continue
+		}
+	}
+
+	return resp, nil
+}
+
+// matchConstraints is a utility function that will return if all or any constraints have matched for a segment depending
+// on the match type.
+func (s *Server) matchConstraints(evalCtx map[string]string, constraints []storage.EvaluationConstraint, segmentMatchType core.MatchType, entityId string) (bool, string, error) {
+	constraintMatches := 0
+
+	var reason string
+	for _, c := range constraints {
+		v := evalCtx[c.Property]
+
+		var (
+			match bool
+			err   error
+		)
+
+		switch c.Type {
+		case core.ComparisonType_STRING_COMPARISON_TYPE:
+			match, err = matchesString(c, v)
+		case core.ComparisonType_NUMBER_COMPARISON_TYPE:
+			match, err = matchesNumber(c, v)
+		case core.ComparisonType_BOOLEAN_COMPARISON_TYPE:
+			match, err = matchesBool(c, v)
+		case core.ComparisonType_DATETIME_COMPARISON_TYPE:
+			match, err = matchesDateTime(c, v)
+		case core.ComparisonType_ENTITY_ID_COMPARISON_TYPE:
+			match, err = matchesString(c, entityId)
+		default:
+			return false, reason, errs.ErrInvalid("unknown constraint type")
+		}
+
+		if err != nil {
+			s.logger.Debug("error matching constraint", zap.String("property", c.Property), zap.Error(err))
+			// don't return here because we want to continue to evaluate the other constraints
+		}
+
+		if match {
+			// increase the matchCount
+			constraintMatches++
+			if segmentMatchType == core.MatchType_ANY_MATCH_TYPE {
+				// can short circuit here since we had at least one match
+				break
+			}
+		} else if segmentMatchType == core.MatchType_ALL_MATCH_TYPE {
+			// we can short circuit because we must match all constraints
+			break
+		}
+	}
+
+	matched := true
+
+	switch segmentMatchType {
+	case core.MatchType_ALL_MATCH_TYPE:
+		if len(constraints) != constraintMatches {
+			reason = "did not match ALL constraints"
+			matched = false
+		}
+
+	case core.MatchType_ANY_MATCH_TYPE:
+		if len(constraints) > 0 && constraintMatches == 0 {
+			reason = "did not match ANY constraints"
+			matched = false
+		}
+	default:
+		reason = fmt.Sprintf("unknown match type %d", segmentMatchType)
+		matched = false
+	}
+
+	return matched, reason, nil
+}
+
+func crc32Num(entityID string, salt string) uint {
+	return uint(crc32.ChecksumIEEE([]byte(salt+entityID))) % totalBucketNum
+}
+
+const (
+	// totalBucketNum represents how many buckets we can use to determine the consistent hashing
+	// distribution and rollout
+	totalBucketNum uint = 1000
+
+	// percentMultiplier implies that the multiplier between percentage (100) and totalBucketNum
+	percentMultiplier float32 = float32(totalBucketNum) / 100
+)
+
+func matchesString(c storage.EvaluationConstraint, v string) (bool, error) {
+	switch c.Operator {
+	case flipt.OpEmpty:
+		return len(strings.TrimSpace(v)) == 0, nil
+	case flipt.OpNotEmpty:
+		return len(strings.TrimSpace(v)) != 0, nil
+	}
+
+	if v == "" {
+		return false, nil
+	}
+
+	value := c.Value
+
+	switch c.Operator {
+	case flipt.OpEQ:
+		return value == v, nil
+	case flipt.OpNEQ:
+		return value != v, nil
+	case flipt.OpPrefix:
+		return strings.HasPrefix(strings.TrimSpace(v), value), nil
+	case flipt.OpSuffix:
+		return strings.HasSuffix(strings.TrimSpace(v), value), nil
+	case flipt.OpIsOneOf:
+		if c.StringSet == nil {
+			return false, errs.ErrInvalidf("constraint %q not prepared for evaluation", c.Property)
+		}
+		_, ok := c.StringSet[v]
+		return ok, nil
+	case flipt.OpIsNotOneOf:
+		if c.StringSet == nil {
+			return false, errs.ErrInvalidf("constraint %q not prepared for evaluation", c.Property)
+		}
+		_, ok := c.StringSet[v]
+		return !ok, nil
+	case flipt.OpContains:
+		return strings.Contains(v, value), nil
+	case flipt.OpNotContains:
+		return !strings.Contains(v, value), nil
+	}
+
+	return false, nil
+}
+
+func matchesNumber(c storage.EvaluationConstraint, v string) (bool, error) {
+	switch c.Operator {
+	case flipt.OpNotPresent:
+		return len(strings.TrimSpace(v)) == 0, nil
+	case flipt.OpPresent:
+		return len(strings.TrimSpace(v)) != 0, nil
+	}
+
+	// can't parse an empty string
+	if v == "" {
+		return false, nil
+	}
+
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return false, errs.ErrInvalidf("parsing number from %q", v)
+	}
+
+	switch c.Operator {
+	case flipt.OpIsOneOf:
+		if c.NumberSet == nil {
+			return false, errs.ErrInvalidf("constraint %q not prepared for evaluation", c.Property)
+		}
+		_, ok := c.NumberSet[n]
+		return ok, nil
+	case flipt.OpIsNotOneOf:
+		if c.NumberSet == nil {
+			return false, errs.ErrInvalidf("constraint %q not prepared for evaluation", c.Property)
+		}
+		_, ok := c.NumberSet[n]
+		return !ok, nil
+	case flipt.OpEQ, flipt.OpNEQ, flipt.OpLT, flipt.OpLTE, flipt.OpGT, flipt.OpGTE:
+		if c.Number == nil {
+			return false, errs.ErrInvalidf("constraint %q not prepared for evaluation", c.Property)
+		}
+		value := *c.Number
+		switch c.Operator {
+		case flipt.OpEQ:
+			return value == n, nil
+		case flipt.OpNEQ:
+			return value != n, nil
+		case flipt.OpLT:
+			return n < value, nil
+		case flipt.OpLTE:
+			return n <= value, nil
+		case flipt.OpGT:
+			return n > value, nil
+		case flipt.OpGTE:
+			return n >= value, nil
+		}
+	}
+
+	return false, nil
+}
+
+func matchesBool(c storage.EvaluationConstraint, v string) (bool, error) {
+	switch c.Operator {
+	case flipt.OpNotPresent:
+		return len(strings.TrimSpace(v)) == 0, nil
+	case flipt.OpPresent:
+		return len(strings.TrimSpace(v)) != 0, nil
+	}
+
+	// can't parse an empty string
+	if v == "" {
+		return false, nil
+	}
+
+	value, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, errs.ErrInvalidf("parsing boolean from %q", v)
+	}
+
+	switch c.Operator {
+	case flipt.OpTrue:
+		return value, nil
+	case flipt.OpFalse:
+		return !value, nil
+	}
+
+	return false, nil
+}
+
+func matchesDateTime(c storage.EvaluationConstraint, v string) (bool, error) {
+	switch c.Operator {
+	case flipt.OpNotPresent:
+		return len(strings.TrimSpace(v)) == 0, nil
+	case flipt.OpPresent:
+		return len(strings.TrimSpace(v)) != 0, nil
+	}
+
+	// can't parse an empty string
+	if v == "" {
+		return false, nil
+	}
+
+	d, err := tryParseDateTime(v)
+	if err != nil {
+		return false, err
+	}
+
+	value, err := tryParseDateTime(c.Value)
+	if err != nil {
+		return false, err
+	}
+
+	switch c.Operator {
+	case flipt.OpEQ:
+		return value.Equal(d), nil
+	case flipt.OpNEQ:
+		return !value.Equal(d), nil
+	case flipt.OpLT:
+		return d.Before(value), nil
+	case flipt.OpLTE:
+		return d.Before(value) || value.Equal(d), nil
+	case flipt.OpGT:
+		return d.After(value), nil
+	case flipt.OpGTE:
+		return d.After(value) || value.Equal(d), nil
+	}
+
+	return false, nil
+}
+
+func tryParseDateTime(v string) (time.Time, error) {
+	if d, err := time.Parse(time.RFC3339, v); err == nil {
+		return d.UTC(), nil
+	}
+
+	if d, err := time.Parse(time.DateOnly, v); err == nil {
+		return d.UTC(), nil
+	}
+
+	return time.Time{}, errs.ErrInvalidf("parsing datetime from %q", v)
+}
+
+func getVariant(key string, variants ...*core.Variant) (*core.Variant, bool) {
+	for _, v := range variants {
+		if v.Key == key {
+			return v, true
+		}
+	}
+
+	return nil, false
+}

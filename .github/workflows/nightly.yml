@@ -1,0 +1,141 @@
+name: Release (Nightly)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 22 * * *" # nightly @ 10:30 PM UTC. Note: this only works on the default branch.
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  nightly-build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: macos-latest
+            name: darwin
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: v2
+
+      - name: Install GCC for arm64
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update && \
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install Quill
+        if: matrix.os == 'macos-latest'
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/quill/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Install mise
+        uses: jdx/mise-action@v5
+
+      - name: Prep Build
+        run: mise run prep
+
+      # Nightly builds run from the v2 branch rather than a release tag, so use the
+      # latest v2 semver tag as the changelog baseline instead of letting goreleaser
+      # infer it from git ancestry. This matches the release workflow safety net for
+      # orphaned release tags.
+      - name: Determine previous release tag
+        id: prev_tag
+        run: |
+          prev=$(git tag -l 'v2.*' --sort=-v:refname | head -n 1)
+          echo "Previous tag: ${prev:-<none>}"
+          echo "previous_tag=${prev}" >> "$GITHUB_OUTPUT"
+
+      - name: GoReleaser (Nightly) Build
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser-pro
+          version: "~> v2.14"
+          args: release --nightly -f .goreleaser.${{ matrix.name }}.yml
+        env:
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_PREVIOUS_TAG: ${{ steps.prev_tag.outputs.previous_tag }}
+          ANALYTICS_WRITE_KEY: ${{ secrets.ANALYTICS_WRITE_KEY }}
+          ANALYTICS_WRITE_ENDPOINT: ${{ secrets.ANALYTICS_WRITE_ENDPOINT }}
+          QUILL_SIGN_P12: ${{ secrets.QUILL_SIGN_P12 }}
+          QUILL_SIGN_PASSWORD: ${{ secrets.QUILL_SIGN_PASSWORD }}
+          KEYGEN_VERIFY_KEY: ${{ secrets.KEYGEN_VERIFY_KEY }}
+          KEYGEN_ACCOUNT_ID: ${{ secrets.KEYGEN_ACCOUNT_ID }}
+          KEYGEN_PRODUCT_ID: ${{ secrets.KEYGEN_PRODUCT_ID }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: flipt-nightly-${{ matrix.name }}
+          path: dist/flipt_${{ matrix.name }}_*/flipt
+
+  nightly-release:
+    runs-on: ubuntu-latest
+    needs: nightly-build
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install mise
+        uses: jdx/mise-action@v5
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: "${{ github.repository_owner }}"
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: flipt-nightly-linux
+          path: tmp/dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: flipt-nightly-darwin
+          path: tmp/dist
+
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+      # Nightly releases run from the v2 branch rather than a release tag, so use the
+      # latest v2 semver tag as the changelog baseline instead of letting goreleaser
+      # infer it from git ancestry. This matches the release workflow safety net for
+      # orphaned release tags.
+      - name: Determine previous release tag
+        id: prev_tag
+        run: |
+          prev=$(git tag -l 'v2.*' --sort=-v:refname | head -n 1)
+          echo "Previous tag: ${prev:-<none>}"
+          echo "previous_tag=${prev}" >> "$GITHUB_OUTPUT"
+
+      - name: GoReleaser (Nightly) Release
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser-pro
+          version: "~> v2.14"
+          args: release --nightly -f .goreleaser.nightly.yml
+        env:
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_PREVIOUS_TAG: ${{ steps.prev_tag.outputs.previous_tag }}

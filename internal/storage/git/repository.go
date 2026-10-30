@@ -1,0 +1,1320 @@
+package git
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"net"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/go-git/go-billy/v6/osfs"
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/config"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/cache"
+	"github.com/go-git/go-git/v6/plumbing/client"
+	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/plumbing/transport"
+	"github.com/go-git/go-git/v6/storage"
+	gitfilesystem "github.com/go-git/go-git/v6/storage/filesystem"
+	"github.com/go-git/go-git/v6/storage/memory"
+	"github.com/go-git/go-git/v6/x/fdpool"
+	"go.flipt.io/flipt/errors"
+	"go.flipt.io/flipt/internal/containers"
+	envsfs "go.flipt.io/flipt/internal/storage/environments/fs"
+	"go.flipt.io/flipt/internal/storage/git/signing"
+	"go.uber.org/zap"
+)
+
+type Repository struct {
+	*git.Repository
+
+	logger *zap.Logger
+
+	mu                        sync.RWMutex
+	remote                    *config.RemoteConfig
+	lenientFetchPolicyEnabled bool
+	defaultBranch             string
+	gitClientOptions          []client.Option
+	localPath                 string
+	readme                    []byte
+	sigName                   string
+	sigEmail                  string
+	signer                    signing.Signer
+	maxOpenDescriptors        int
+	isNormalRepo              bool // true if opened with PlainOpen, false if bare repository
+
+	// subsMu guards subs for readers that must not wait on mu, which is
+	// held for the duration of a fetch.
+	subsMu sync.RWMutex
+	subs   []Subscriber
+
+	pollInterval time.Duration
+	cancel       func()
+	done         chan struct{}
+
+	metrics repoMetrics
+}
+
+type Subscriber interface {
+	Branches() []string
+	Notify(ctx context.Context, heads map[string]string) error
+}
+
+func NewRepository(ctx context.Context, logger *zap.Logger, opts ...containers.Option[Repository]) (*Repository, error) {
+	repo, empty, err := newRepository(ctx, logger, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	if empty {
+		logger.Debug("repository empty, attempting to add and push a README")
+		// add initial readme if repo is empty
+		if _, err := repo.UpdateAndPush(ctx, repo.defaultBranch, func(fs envsfs.Filesystem) (string, error) {
+			fi, err := fs.OpenFile("README.md", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+			if err != nil {
+				return "", err
+			}
+
+			if _, err := fi.Write(repo.readme); err != nil {
+				return "", err
+			}
+
+			if err := fi.Close(); err != nil {
+				return "", err
+			}
+
+			return "add initial README", nil
+		}, UpdateWithInitialCommit); err != nil {
+			return nil, err
+		}
+	}
+
+	repo.startPolling(ctx)
+
+	return repo, nil
+}
+
+// newRepository is a wrapper around the core *git.Repository
+// It handles configuring a repository source appropriately based on our configuration
+// It also exposes some common operations and ensures safe concurrent access while fetching and pushing
+func newRepository(ctx context.Context, logger *zap.Logger, opts ...containers.Option[Repository]) (_ *Repository, empty bool, err error) {
+	r := &Repository{
+		logger:        logger,
+		defaultBranch: "main",
+		readme:        []byte(defaultReadmeContents),
+		// we initialize with a noop function incase
+		// we dont start the polling loop
+		cancel: func() {},
+		done:   make(chan struct{}),
+	}
+
+	containers.ApplyAll(r, opts...)
+
+	var metricsOpts []containers.Option[repoMetrics]
+
+	// we initially assume the repo is empty because we start
+	// with an in-memory blank slate
+	empty = true
+	storage := storage.Storer(memory.NewStorage())
+	r.Repository, err = git.Init(storage, git.WithDefaultBranch(plumbing.NewBranchReferenceName(r.defaultBranch)))
+	if err != nil {
+		return nil, empty, err
+	}
+
+	if r.localPath != "" {
+		storage = gitfilesystem.NewStorageWithOptions(osfs.New(r.localPath), cache.NewObjectLRUDefault(), gitfilesystem.Options{
+			Pool: fdpool.New(r.maxOpenDescriptors),
+		})
+
+		entries, err := os.ReadDir(r.localPath)
+		if empty = err != nil || len(entries) == 0; empty {
+			// either its empty or there was an error opening the file
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, empty, err
+			}
+
+			r.Repository, err = git.Init(storage, git.WithDefaultBranch(plumbing.NewBranchReferenceName(r.defaultBranch)))
+			if err != nil {
+				return nil, empty, err
+			}
+		} else {
+			// Directory has content - check if it has a .git subdirectory (normal repo) or bare repo files
+			gitDir := filepath.Join(r.localPath, ".git")
+			if _, err := os.Stat(gitDir); err == nil {
+				// .git subdirectory exists - this is a normal Git repository
+				r.Repository, err = git.PlainOpenWithOptions(r.localPath, &git.PlainOpenOptions{DetectDotGit: false})
+				if err != nil {
+					return nil, empty, fmt.Errorf("opening normal git repository: %w", err)
+				}
+				r.isNormalRepo = true
+
+				// Check if repository has commits
+				head, err := r.Repository.Head()
+				switch {
+				case errors.Is(err, plumbing.ErrReferenceNotFound):
+					empty = true
+				case err != nil:
+					return nil, empty, fmt.Errorf("resolving HEAD: %w", err)
+				default:
+					empty = false
+
+					// For normal repositories, ensure remote tracking reference exists
+					// This is needed for Flipt's branch management to work correctly
+					remoteRef := plumbing.NewReferenceFromStrings("refs/remotes/origin/"+r.defaultBranch, head.Hash().String())
+					if err := r.Repository.Storer.SetReference(remoteRef); err != nil {
+						return nil, empty, fmt.Errorf("setting remote tracking reference: %w", err)
+					}
+				}
+			} else {
+				// No .git subdirectory - try to open as bare repository or create one
+				r.Repository, err = git.Open(storage, nil)
+				if err != nil {
+					// No repository exists, initialize new bare repository
+					r.Repository, err = git.Init(storage, git.WithDefaultBranch(plumbing.NewBranchReferenceName(r.defaultBranch)))
+					if err != nil {
+						return nil, empty, err
+					}
+					// Directory has content but no Git repo - mark as empty to commit existing files
+					empty = true
+				}
+			}
+		}
+	}
+
+	if r.remote != nil {
+		if len(r.remote.URLs) == 0 {
+			return nil, empty, errors.New("must supply at-least one remote URL")
+		}
+
+		metricsOpts = append(metricsOpts, withRemote(r.remote.URLs[0]))
+
+		if _, err = r.CreateRemote(r.remote); err != nil {
+			if !errors.Is(err, git.ErrRemoteExists) {
+				return nil, empty, err
+			}
+
+			// check if there is any difference between Flipt configuration and local git checkout
+			// and synchronize if needed.
+			gitConfig, err := r.Config()
+			if err != nil {
+				return nil, empty, fmt.Errorf("failed to read local git config: %w", err)
+			}
+
+			// safely check if remote exists and if URLs differ
+			existingRemote, exists := gitConfig.Remotes[r.remote.Name]
+			if !exists || !slices.Equal(existingRemote.URLs, r.remote.URLs) {
+				r.logger.Info("synchronizing git remote URL with Flipt configuration",
+					zap.String("remote", r.remote.Name),
+					zap.Strings("previous_urls", func() []string {
+						if exists && existingRemote != nil {
+							return existingRemote.URLs
+						}
+						return nil
+					}()),
+					zap.Strings("new_urls", r.remote.URLs))
+
+				gitConfig.Remotes[r.remote.Name] = r.remote
+				if err := r.SetConfig(gitConfig); err != nil {
+					return nil, empty, fmt.Errorf("failed to update local git config: %w", err)
+				}
+			}
+		}
+
+		// given an upstream has been configured we're going to start
+		// by changing our assumption to the repository having contents
+		empty = false
+
+		// do an initial fetch to setup remote tracking branches
+		if err := r.Fetch(ctx); err != nil {
+			fetchErr := fmt.Errorf("performing initial fetch: %w", err)
+			switch {
+			case r.HasLenientFetchPolicy() && r.IsConnectionRefused(err):
+				// if lenient, we check if the error is connection refused
+				// and there is non-empty repo and flags could be evaluated
+				objs, rerr := r.CommitObjects()
+				if rerr != nil {
+					return nil, empty, fetchErr
+				}
+				_, rerr = objs.Next()
+				objs.Close()
+				if rerr != nil {
+					return nil, empty, fetchErr
+				}
+				logger.Warn("initial fetch failed but lenient fetch policy is enabled and repository has existing commits, continuing", zap.Error(err))
+			case errors.Is(err, transport.ErrEmptyRemoteRepository) || errors.Is(err, git.ErrRemoteRefNotFound):
+				// the remote was reachable but either its contents was completely empty
+				// or our default branch doesn't exist and so we decide to seed it
+				empty = true
+				logger.Debug("initial fetch empty", zap.String("reference", r.defaultBranch), zap.Error(err))
+			default:
+				return nil, empty, fetchErr
+			}
+		}
+	}
+
+	r.metrics = newRepoMetrics(metricsOpts...)
+
+	if plumbing.IsHash(r.defaultBranch) {
+		// if we still need to add an initial commit to the repository then we assume they couldn't
+		// have predicted the initial hash and return reference not found
+		if empty {
+			return nil, empty, fmt.Errorf("target repository is empty: %w", plumbing.ErrReferenceNotFound)
+		}
+
+		return r, empty, r.Storer.SetReference(plumbing.NewHashReference(plumbing.HEAD, plumbing.NewHash(r.defaultBranch)))
+	}
+
+	return r, empty, nil
+}
+
+func (r *Repository) startPolling(ctx context.Context) {
+	if r.pollInterval == 0 {
+		close(r.done)
+		return
+	}
+
+	go func() {
+		defer close(r.done)
+
+		ticker := time.NewTicker(r.pollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := r.Fetch(ctx); err != nil {
+					r.metrics.recordPollError(ctx)
+					r.logger.Error("error performing fetch", zap.Error(err))
+					continue
+				}
+
+				r.logger.Debug("fetch successful")
+			}
+		}
+	}()
+}
+
+func (r *Repository) GetRemote() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.remote == nil {
+		return ""
+	}
+
+	return r.remote.URLs[0]
+}
+
+func (r *Repository) GetDefaultBranch() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.defaultBranch
+}
+
+func (r *Repository) Close() error {
+	r.cancel()
+
+	<-r.done
+
+	return nil
+}
+
+func (r *Repository) Subscribe(sub Subscriber) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.subsMu.Lock()
+	defer r.subsMu.Unlock()
+
+	r.subs = append(r.subs, sub)
+}
+
+// Tracks reports whether a fetch would update the given branch: it is the
+// default branch, or it matches a branch pattern of any subscriber.
+// It does not block on an in-flight fetch.
+func (r *Repository) Tracks(branch string) bool {
+	if branch == r.defaultBranch {
+		return true
+	}
+
+	for _, sub := range r.subscribers() {
+		for _, pattern := range sub.Branches() {
+			if refMatch(branch, pattern) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// subscribers returns a snapshot of the current subscribers. Callers iterate
+// the copy without holding subsMu, so a subscriber callback that calls back
+// into the repository can't deadlock against a concurrent Subscribe, which
+// takes mu before subsMu.
+func (r *Repository) subscribers() []Subscriber {
+	r.subsMu.RLock()
+	defer r.subsMu.RUnlock()
+
+	return slices.Clone(r.subs)
+}
+
+func (r *Repository) fetchHeads() []string {
+	heads := map[string]struct{}{r.defaultBranch: {}}
+	for _, sub := range r.subscribers() {
+		for _, head := range sub.Branches() {
+			heads[head] = struct{}{}
+		}
+	}
+
+	return slices.Collect(maps.Keys(heads))
+}
+
+// IsConnectionRefused checks if the provided error is a connection refused error or DNS resolution error.
+func (r *Repository) IsConnectionRefused(err error) bool {
+	// Check for DNS errors (e.g., "no such host")
+	if dnsError, ok := errors.As[*net.DNSError](err); ok {
+		return dnsError.IsNotFound || dnsError.IsTemporary
+	}
+
+	// Check for network timeout errors
+	if netErr, ok := errors.As[net.Error](err); ok && netErr.Timeout() {
+		return true
+	}
+
+	// Check for syscall network errors
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTDOWN)
+}
+
+// HasLenientFetchPolicy returns true if the fetch policy set to lenient.
+func (r *Repository) HasLenientFetchPolicy() bool {
+	return r.lenientFetchPolicyEnabled
+}
+
+// Fetch does a fetch for the requested head names on a configured remote.
+// If the remote is not defined, then it is a silent noop.
+// If specific is explicitly requested then only the heads in specific are fetched.
+// Otherwise, it fetches all previously tracked head references.
+func (r *Repository) Fetch(ctx context.Context, specific ...string) (err error) {
+	if r.remote == nil {
+		return nil
+	}
+
+	updatedRefs := map[string]plumbing.Hash{}
+	r.mu.Lock()
+	defer func() {
+		r.mu.Unlock()
+		r.updateSubs(ctx, updatedRefs)
+	}()
+
+	heads := specific
+	if len(heads) == 0 {
+		heads = r.fetchHeads()
+	}
+
+	return r.fetch(ctx, heads, updatedRefs)
+}
+
+// fetch fetches heads from the configured remote and records each updated
+// branch head in updatedRefs, so the caller can notify subscribers about them.
+// The caller must hold r.mu and must ensure a remote is configured.
+func (r *Repository) fetch(ctx context.Context, heads []string, updatedRefs map[string]plumbing.Hash) error {
+	refSpecs := []config.RefSpec{}
+
+	for _, head := range heads {
+		refSpec := config.RefSpec(
+			fmt.Sprintf(
+				"+%s:%s",
+				plumbing.NewBranchReferenceName(head),
+				plumbing.NewRemoteReferenceName(r.remote.Name, head),
+			),
+		)
+
+		r.logger.Debug("preparing refspec for fetch", zap.Stringer("refspec", refSpec))
+
+		refSpecs = append(refSpecs, refSpec)
+	}
+
+	opts := &git.FetchOptions{
+		RemoteName:    r.remote.Name,
+		ClientOptions: r.gitClientOptions,
+		RefSpecs:      refSpecs,
+		Prune:         true,
+		Tags:          plumbing.NoTags,
+	}
+
+	// For bare repositories (i.e., repositories without a working tree),
+	// limit the fetch to a depth of 1 so that only the latest commit is
+	// retrieved. Since no checkout will occur, a full history is unnecessary
+	// and would only increase network transfer and storage usage.
+	if !r.isNormalRepo {
+		opts.Depth = 1
+	}
+
+	if err := r.FetchContext(ctx, opts); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+		return err
+	}
+
+	allRefs, err := r.References()
+	if err != nil {
+		return err
+	}
+	if err := allRefs.ForEach(func(ref *plumbing.Reference) error {
+		// we're only interested in updates to remotes
+		if !ref.Name().IsRemote() {
+			return nil
+		}
+
+		for _, head := range heads {
+			name := strings.TrimPrefix(ref.Name().String(), "refs/remotes/origin/")
+			if refMatch(name, head) {
+				updatedRefs[name] = ref.Hash()
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Get all existing local branch refs
+	allLocalRefs, err := r.Storer.IterReferences()
+	if err != nil {
+		return fmt.Errorf("failed to get local refs: %w", err)
+	}
+
+	existingHeads := make(map[string]struct{})
+	if err := allLocalRefs.ForEach(func(ref *plumbing.Reference) error {
+		if ref.Name().IsBranch() {
+			branchName := strings.TrimPrefix(ref.Name().String(), "refs/heads/")
+			existingHeads[branchName] = struct{}{}
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to iterate local refs: %w", err)
+	}
+
+	// Update refs for branches that exist on remote
+	for name, hash := range updatedRefs {
+		ref := plumbing.NewHashReference(plumbing.NewBranchReferenceName(name), hash)
+		if err := r.Storer.SetReference(ref); err != nil {
+			return fmt.Errorf("failed to set reference %s: %w", name, err)
+		}
+		delete(existingHeads, name)
+	}
+
+	// Remove local refs for branches that no longer exist on remote
+	for branchName := range existingHeads {
+		refName := plumbing.NewBranchReferenceName(branchName)
+		// Check if this branch is one we're tracking
+		isTracked := false
+		for _, head := range heads {
+			if refMatch(branchName, head) {
+				isTracked = true
+				break
+			}
+		}
+		if isTracked {
+			if err := r.Storer.RemoveReference(refName); err != nil {
+				return fmt.Errorf("failed to remove reference %s: %w", branchName, err)
+			}
+		}
+	}
+
+	if opts.Depth == 1 {
+		// When performing a depth=1 fetch, maintain the shallow boundary in the object store.
+		// For shallow clones, we track which commits are shallow to prevent operations that
+		// require complete commit history from proceeding.
+		shallows, err := r.Storer.Shallow()
+		if err != nil {
+			return fmt.Errorf("failed to get shallows: %w", err)
+		}
+		shallows = slices.AppendSeq(shallows, maps.Values(updatedRefs))
+		slices.SortFunc(shallows, func(a plumbing.Hash, b plumbing.Hash) int {
+			return a.Compare(b.Bytes())
+		})
+		if err := r.Storer.SetShallow(slices.Compact(shallows)); err != nil {
+			return fmt.Errorf("failed to set shallows: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// ViewOptions are options for the View method.
+type ViewOptions struct {
+	hash plumbing.Hash
+}
+
+// ViewWithHash configures a call to View with a specific hash.
+func ViewWithHash(hash plumbing.Hash) containers.Option[ViewOptions] {
+	return func(vo *ViewOptions) {
+		vo.hash = hash
+	}
+}
+
+// View reads the head of the given branch and passes the resulting git tree via
+// the envsfs.Filesystem abstraction to the provided function.
+func (r *Repository) View(
+	ctx context.Context,
+	branch string,
+	fn func(hash plumbing.Hash, fs envsfs.Filesystem) error,
+	opts ...containers.Option[ViewOptions],
+) (err error) {
+	var vopts ViewOptions
+	containers.ApplyAll(&vopts, opts...)
+
+	finished := r.metrics.recordView(ctx, branch)
+
+	r.mu.RLock()
+	defer func() {
+		r.mu.RUnlock()
+
+		finished(err)
+	}()
+
+	hash := vopts.hash
+	if hash == plumbing.ZeroHash {
+		hash, err = r.Resolve(branch)
+		if err != nil {
+			return err
+		}
+	}
+
+	r.logger.Debug("view", zap.String("branch", branch), zap.Stringer("hash", hash))
+
+	fs, err := r.newFilesystem(hash)
+	if err != nil {
+		return err
+	}
+
+	return fn(hash, fs)
+}
+
+type UpdateAndPushOptions struct {
+	initialCommit bool
+	ifHeadMatches *plumbing.Hash
+}
+
+// UpdateWithInitialCommit configures a call to UpdateAndPush to intentionally
+// create an initial commit
+func UpdateWithInitialCommit(uapo *UpdateAndPushOptions) {
+	uapo.initialCommit = true
+}
+
+// UpdateIfHeadMatches predicates that an update should return an error early if the target branch
+// does not match the supplied hash.
+// This allows for updates to attempt a form of optimistic update and retry in the case of a conflict.
+func UpdateIfHeadMatches(hash *plumbing.Hash) containers.Option[UpdateAndPushOptions] {
+	return func(uapo *UpdateAndPushOptions) {
+		uapo.ifHeadMatches = hash
+	}
+}
+
+// headMatches reports whether hash satisfies the expected head revision, if
+// the caller supplied one.
+func (o UpdateAndPushOptions) headMatches(hash plumbing.Hash) bool {
+	return o.ifHeadMatches == nil || o.ifHeadMatches.IsZero() || *o.ifHeadMatches == hash
+}
+
+// checkHead returns a conflict error if the caller supplied an expected head
+// revision which does not match hash.
+func (o UpdateAndPushOptions) checkHead(logger *zap.Logger, hash plumbing.Hash) error {
+	if o.headMatches(hash) {
+		return nil
+	}
+
+	logger.Warn("head revision mismatch",
+		zap.Stringer("expected", *o.ifHeadMatches),
+		zap.Stringer("actual", hash))
+
+	return errors.ErrConflictf("expected head revision %q has changed (now %q)", *o.ifHeadMatches, hash)
+}
+
+// UpdateAndPush calls the provided function with a Filesystem implementation which intercepts any write
+// operations and builds the changes into a commit.
+// On non-fast-forward errors fn is re-executed against a fresh filesystem rooted at the updated remote head,
+// unless a non-zero UpdateIfHeadMatches revision was supplied, in which case a conflict error is returned instead.
+// fn should be free of side effects beyond the filesystem.
+// Given an upstream remote is configured, the commit is also pushed to the given branch.
+func (r *Repository) UpdateAndPush(
+	ctx context.Context,
+	branch string,
+	fn func(fs envsfs.Filesystem) (string, error),
+	opts ...containers.Option[UpdateAndPushOptions],
+) (hash plumbing.Hash, err error) {
+	var (
+		finished = r.metrics.recordUpdate(ctx, branch)
+		options  UpdateAndPushOptions
+		commit   *object.Commit
+		// refs fetched while checking the expected head, which subscribers
+		// must hear about even when the update itself fails
+		fetchedRefs = map[string]plumbing.Hash{}
+	)
+
+	containers.ApplyAll(&options, opts...)
+
+	r.logger.Debug("starting update and push operation",
+		zap.String("branch", branch),
+		zap.Bool("initialCommit", options.initialCommit),
+		zap.Any("remoteConfig", r.remote))
+
+	r.mu.Lock()
+	defer func() {
+		r.mu.Unlock()
+		if commit != nil {
+			fetchedRefs[branch] = commit.Hash
+		}
+		if len(fetchedRefs) > 0 {
+			// update references
+			r.updateSubs(ctx, fetchedRefs)
+		}
+		finished(err)
+	}()
+
+	if !options.initialCommit {
+		// for non initial commits we start by resolving the current head
+		hash, err = r.Resolve(branch)
+		if err != nil {
+			return plumbing.ZeroHash, err
+		}
+
+		r.logger.Debug("resolved current head",
+			zap.String("branch", branch),
+			zap.Stringer("hash", hash))
+
+		// The caller may have observed a newer head than this repository has
+		// fetched, e.g. one pushed by another instance sharing the remote.
+		// Fetch the branch once so that a stale local view doesn't produce a
+		// false conflict.
+		if !options.headMatches(hash) && r.remote != nil {
+			r.logger.Debug("expected head revision differs, fetching branch",
+				zap.String("branch", branch),
+				zap.Stringer("expected", *options.ifHeadMatches),
+				zap.Stringer("actual", hash))
+
+			if ferr := r.fetch(ctx, []string{branch}, fetchedRefs); ferr != nil {
+				r.logger.Warn("fetching branch to recheck head revision",
+					zap.String("branch", branch),
+					zap.Error(ferr))
+			} else if hash, err = r.Resolve(branch); err != nil {
+				return plumbing.ZeroHash, err
+			}
+		}
+	}
+
+	if err := options.checkHead(r.logger, hash); err != nil {
+		return hash, err
+	}
+
+	// if rev == nil then hash will be the zero hash
+	fs, err := r.newFilesystem(hash)
+	if err != nil {
+		return hash, err
+	}
+
+	msg, err := fn(fs)
+	if err != nil {
+		return hash, err
+	}
+
+	r.logger.Debug("creating commit", zap.String("message", msg))
+	commit, err = fs.commit(ctx, msg)
+	if err != nil {
+		return hash, err
+	}
+
+	r.logger.Debug("commit created successfully", zap.Stringer("hash", commit.Hash))
+
+	// For normal repositories, update working directory to match the new commit
+	if r.isNormalRepo && r.localPath != "" {
+		if err := r.updateWorkingDirectory(ctx, commit.Hash); err != nil {
+			r.logger.Warn("failed to update working directory after commit",
+				zap.Stringer("commit", commit.Hash),
+				zap.Error(err))
+			// Don't return error as commit was successful, just log warning
+		}
+	}
+
+	if r.remote == nil {
+		r.logger.Debug("skipping push - no remote configured")
+
+		// update remote tracking reference even without a remote configured
+		remoteRef := plumbing.NewHashReference(
+			plumbing.NewRemoteReferenceName("origin", branch),
+			commit.Hash,
+		)
+		if err := r.Storer.SetReference(remoteRef); err != nil {
+			return hash, err
+		}
+
+		return commit.Hash, nil
+	}
+
+	localRef := plumbing.NewBranchReferenceName(branch)
+	r.logger.Debug("setting local reference",
+		zap.Stringer("reference", localRef),
+		zap.Stringer("hash", commit.Hash))
+
+	if err := r.Storer.SetReference(plumbing.NewHashReference(localRef, commit.Hash)); err != nil {
+		return hash, err
+	}
+
+	r.logger.Debug("pushing to remote",
+		zap.String("remoteName", r.remote.Name),
+		zap.Strings("remoteURLs", r.remote.URLs),
+		zap.Stringer("refSpec", config.RefSpec(fmt.Sprintf("%[1]s:%[1]s", localRef))))
+
+	pushErr := r.PushContext(ctx, &git.PushOptions{
+		RemoteName:    r.remote.Name,
+		ClientOptions: r.gitClientOptions,
+		RefSpecs: []config.RefSpec{
+			config.RefSpec(fmt.Sprintf("%[1]s:%[1]s", localRef)),
+		},
+	})
+	if pushErr != nil {
+		if pushErr.Error() != fmt.Sprintf("non-fast-forward update: %s", localRef) {
+			return hash, pushErr
+		}
+
+		r.logger.Info("non-fast-forward update, fetching and retrying",
+			zap.String("branch", branch))
+
+		// go-git v6 rejects a direct-child push with a false non-fast-forward
+		// error when two depth=1 shallow boundaries overlap (see #6478, fixed
+		// upstream in go-git#2373). When our corrected ancestry check
+		// says the commit is a fast-forward, push the same commit with shallow
+		// markers temporarily cleared instead of rebasing onto an unmoved head.
+		if ff, ferr := r.isFastForwardLocal(hash, commit.Hash); ferr == nil && ff {
+			if h, ok := r.pushSameCommitOnFalsePositive(ctx, branch, localRef, commit); ok {
+				return h, nil
+			}
+			// Otherwise fall through to the standard fetch-and-rebase retry below.
+		}
+
+		fetchRefSpec := config.RefSpec(
+			fmt.Sprintf(
+				"+%s:%s",
+				localRef,
+				plumbing.NewRemoteReferenceName(r.remote.Name, branch),
+			),
+		)
+		fetchOpts := &git.FetchOptions{
+			RemoteName:    r.remote.Name,
+			ClientOptions: r.gitClientOptions,
+			RefSpecs:      []config.RefSpec{fetchRefSpec},
+			Tags:          plumbing.NoTags,
+		}
+		if !r.isNormalRepo {
+			fetchOpts.Depth = 1
+		}
+		if err := r.FetchContext(ctx, fetchOpts); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+			return plumbing.ZeroHash, fmt.Errorf("fetching branch after non-fast-forward: %w", err)
+		}
+		if fetchOpts.Depth == 1 {
+			remoteRef, err := r.Repository.Reference(
+				plumbing.NewRemoteReferenceName(r.remote.Name, branch), true,
+			)
+			if err != nil {
+				return plumbing.ZeroHash, fmt.Errorf("resolving remote ref after fetch: %w", err)
+			}
+			shallows, err := r.Storer.Shallow()
+			if err != nil {
+				return plumbing.ZeroHash, fmt.Errorf("getting shallows: %w", err)
+			}
+			shallows = append(shallows, remoteRef.Hash())
+			slices.SortFunc(shallows, func(a, b plumbing.Hash) int {
+				return a.Compare(b.Bytes())
+			})
+			if err := r.Storer.SetShallow(slices.Compact(shallows)); err != nil {
+				return plumbing.ZeroHash, fmt.Errorf("setting shallows: %w", err)
+			}
+		}
+
+		hash, err = r.Resolve(branch)
+		if err != nil {
+			return plumbing.ZeroHash, err
+		}
+
+		// the remote head has moved on, so a caller which supplied the revision it
+		// last observed must get a conflict rather than having fn re-applied over
+		// changes it has not seen
+		if err := options.checkHead(r.logger, hash); err != nil {
+			// the commit was never pushed, so don't notify subscribers about it
+			commit = nil
+			return hash, err
+		}
+
+		fs, err = r.newFilesystem(hash)
+		if err != nil {
+			return hash, err
+		}
+
+		msg, err = fn(fs)
+		if err != nil {
+			return hash, err
+		}
+
+		commit, err = fs.commit(ctx, msg)
+		if err != nil {
+			return hash, err
+		}
+
+		if r.isNormalRepo && r.localPath != "" {
+			if err := r.updateWorkingDirectory(ctx, commit.Hash); err != nil {
+				r.logger.Warn("failed to update working directory after commit",
+					zap.Stringer("commit", commit.Hash),
+					zap.Error(err))
+			}
+		}
+
+		if err := r.Storer.SetReference(plumbing.NewHashReference(localRef, commit.Hash)); err != nil {
+			return hash, err
+		}
+
+		if err := r.PushContext(ctx, &git.PushOptions{
+			RemoteName:    r.remote.Name,
+			ClientOptions: r.gitClientOptions,
+			RefSpecs: []config.RefSpec{
+				config.RefSpec(fmt.Sprintf("%[1]s:%[1]s", localRef)),
+			},
+		}); err != nil {
+			return hash, err
+		}
+	}
+
+	// update remote tracking reference to match
+	remoteRef := plumbing.NewHashReference(
+		plumbing.NewRemoteReferenceName(r.remote.Name, branch),
+		commit.Hash,
+	)
+
+	r.logger.Debug("setting remote tracking reference",
+		zap.Stringer("reference", remoteRef.Name()),
+		zap.Stringer("hash", commit.Hash))
+
+	if err := r.Storer.SetReference(remoteRef); err != nil {
+		return hash, err
+	}
+
+	r.logger.Debug("update and push completed successfully",
+		zap.String("branch", branch),
+		zap.Stringer("hash", commit.Hash))
+
+	return commit.Hash, nil
+}
+
+// isFastForwardLocal reports whether newHash is a descendant of old using only
+// locally stored commits. It replicates the corrected go-git behavior from
+// go-git#2373 (fixing go-git#2367, downstream flipt#6478): a
+// shallow boundary we hold stays reachable even when another boundary names it
+// as a parent, matching how git grafts boundaries parentless instead of
+// dropping them. It is used to classify a non-fast-forward push rejection as a
+// genuine conflict or a false positive of the bundled go-git release.
+// TODO: remove once go.mod bumps past upstream go-git#2373.
+func (r *Repository) isFastForwardLocal(old, newHash plumbing.Hash) (bool, error) {
+	c, err := object.GetCommit(r.Storer, newHash)
+	if err != nil {
+		return false, err
+	}
+
+	// Load the shallow commits we still hold, so the walk can both detect when
+	// it reaches a shallow boundary and tell a boundary apart from a commit
+	// that is genuinely absent.
+	shallowCommits := make(map[plumbing.Hash]*object.Commit)
+	if shallows, err := r.Storer.Shallow(); err != nil {
+		return false, err
+	} else {
+		for _, sh := range shallows {
+			shallowCommit, err := object.GetCommit(r.Storer, sh)
+			if err != nil {
+				if errors.Is(err, plumbing.ErrObjectNotFound) {
+					// Shallow marker may reference a commit we no longer have; skip.
+					continue
+				}
+				return false, err
+			}
+
+			shallowCommits[sh] = shallowCommit
+		}
+	}
+
+	// Mark parent hashes as boundaries so the walker never tries to load
+	// commits that are not stored locally, except for boundaries we hold: git
+	// truncates at a boundary by making it parentless rather than by dropping
+	// it, so a boundary we hold stays reachable.
+	parentsToIgnore := []plumbing.Hash{}
+	for _, shallowCommit := range shallowCommits {
+		for _, parent := range shallowCommit.ParentHashes {
+			if _, held := shallowCommits[parent]; held {
+				continue
+			}
+
+			parentsToIgnore = append(parentsToIgnore, parent)
+		}
+	}
+
+	found := false
+	boundedByShallow := false
+	iter := object.NewCommitPreorderIter(c, nil, parentsToIgnore)
+	if err := iter.ForEach(func(c *object.Commit) error {
+		if _, isShallow := shallowCommits[c.Hash]; isShallow {
+			// The walk reached a shallow commit; history is truncated here.
+			boundedByShallow = true
+		}
+		if c.Hash != old {
+			return nil
+		}
+
+		found = true
+		return storer.ErrStop
+	}); err != nil {
+		return false, err
+	}
+	if !found && boundedByShallow {
+		// The walk was bounded by shallow markers and could not reach old.
+		// Fast-forward cannot be disproven from local data alone, so allow it.
+		return true, nil
+	}
+	return found, nil
+}
+
+// pushSameCommitOnFalsePositive recovers from a false non-fast-forward push
+// rejection (see #6478) by pushing the already-built commit unchanged. The
+// commit is always a single-parent child of the branch head, so with shallow
+// markers temporarily cleared the bundled go-git client-side check walks
+// exactly the two present commits and sees the true ancestry. Markers are
+// restored afterwards; a failed push (e.g. the remote genuinely moved, which
+// the server rejects authoritatively) reports ok=false so the caller falls
+// back to the standard fetch-and-rebase retry.
+func (r *Repository) pushSameCommitOnFalsePositive(
+	ctx context.Context,
+	branch string,
+	localRef plumbing.ReferenceName,
+	commit *object.Commit,
+) (hash plumbing.Hash, ok bool) {
+	saved, err := r.Storer.Shallow()
+	if err != nil {
+		return plumbing.ZeroHash, false
+	}
+	if err := r.Storer.SetShallow(nil); err != nil {
+		return plumbing.ZeroHash, false
+	}
+
+	pushErr := r.PushContext(ctx, &git.PushOptions{
+		RemoteName:    r.remote.Name,
+		ClientOptions: r.gitClientOptions,
+		RefSpecs: []config.RefSpec{
+			config.RefSpec(fmt.Sprintf("%[1]s:%[1]s", localRef)),
+		},
+	})
+
+	if rerr := r.Storer.SetShallow(saved); rerr != nil {
+		r.logger.Warn("restoring shallows after false-positive push",
+			zap.String("branch", branch),
+			zap.Error(rerr))
+	}
+	if pushErr != nil {
+		r.logger.Info("same-commit push failed, falling back to rebase retry",
+			zap.String("branch", branch),
+			zap.Error(pushErr))
+		return plumbing.ZeroHash, false
+	}
+
+	remoteRef := plumbing.NewHashReference(
+		plumbing.NewRemoteReferenceName(r.remote.Name, branch),
+		commit.Hash,
+	)
+	if err := r.Storer.SetReference(remoteRef); err != nil {
+		return plumbing.ZeroHash, false
+	}
+
+	r.logger.Info("pushed same commit after false non-fast-forward",
+		zap.String("branch", branch),
+		zap.Stringer("hash", commit.Hash))
+
+	return commit.Hash, true
+}
+
+func (r *Repository) updateSubs(ctx context.Context, refs map[string]plumbing.Hash) {
+	// update subscribers for each matching ref
+	for _, sub := range r.subscribers() {
+		matched := map[string]string{}
+		for ref, hash := range refs {
+			for _, branch := range sub.Branches() {
+				if refMatch(ref, branch) {
+					matched[ref] = hash.String()
+				}
+			}
+		}
+
+		if err := sub.Notify(ctx, matched); err != nil {
+			r.metrics.recordUpdateSubsError(ctx)
+
+			r.logger.Error("while updating subscriber", zap.Error(err))
+		}
+	}
+}
+
+func refMatch(ref, pattern string) bool {
+	if !strings.Contains(pattern, "*") {
+		return ref == pattern
+	}
+
+	return strings.HasPrefix(ref, pattern[:strings.Index(pattern, "*")]) //nolint:gocritic
+}
+
+func (r *Repository) ResolveHead() (plumbing.Hash, error) {
+	return r.Resolve(r.defaultBranch)
+}
+
+func (r *Repository) Resolve(branch string) (plumbing.Hash, error) {
+	remoteName := "origin"
+	if r.remote != nil {
+		remoteName = r.remote.Name
+	}
+
+	reference, err := r.Repository.Reference(plumbing.NewRemoteReferenceName(remoteName, branch), true)
+	if err != nil {
+		return plumbing.ZeroHash, err
+	}
+
+	return reference.Hash(), nil
+}
+
+type CreateBranchOptions struct {
+	base string
+}
+
+func WithBase(name string) containers.Option[CreateBranchOptions] {
+	return func(cbo *CreateBranchOptions) {
+		cbo.base = name
+	}
+}
+
+func (r *Repository) CreateBranchIfNotExists(ctx context.Context, branch string, opts ...containers.Option[CreateBranchOptions]) (err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	remoteName := "origin"
+	if r.remote != nil {
+		remoteName = r.remote.Name
+	}
+
+	remoteRef := plumbing.NewRemoteReferenceName(remoteName, branch)
+	if _, err := r.Reference(remoteRef, true); err == nil {
+		// reference already exists
+		return nil
+	}
+
+	finished := r.metrics.recordBranchCreated(ctx)
+	defer finished(err)
+
+	opt := CreateBranchOptions{base: r.defaultBranch}
+
+	containers.ApplyAll(&opt, opts...)
+
+	reference, err := r.Repository.Reference(plumbing.NewRemoteReferenceName(remoteName, opt.base), true)
+	if err != nil {
+		return fmt.Errorf("base reference %q not found: %w", opt.base, err)
+	}
+
+	if err := r.Storer.SetReference(plumbing.NewHashReference(remoteRef,
+		reference.Hash())); err != nil {
+		return fmt.Errorf("failed to create branch: %w", err)
+	}
+
+	if r.remote != nil {
+		localRef := plumbing.NewRemoteReferenceName(remoteName, branch)
+		refSpec := config.RefSpec(fmt.Sprintf("%s:%s", localRef, plumbing.NewBranchReferenceName(branch)))
+		if err := r.PushContext(ctx, &git.PushOptions{
+			RemoteName:    r.remote.Name,
+			ClientOptions: r.gitClientOptions,
+			RefSpecs:      []config.RefSpec{refSpec},
+		}); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+			return fmt.Errorf("failed to push branch to remote: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (r *Repository) DeleteBranch(ctx context.Context, branch string) (err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	finished := r.metrics.recordBranchDeleted(ctx)
+	defer finished(err)
+
+	// Delete local branch
+	localRef := plumbing.NewBranchReferenceName(branch)
+	if err := r.Storer.RemoveReference(localRef); err != nil {
+		return fmt.Errorf("failed to delete local branch: %w", err)
+	}
+
+	// Delete remote branch if remote is configured
+	if r.remote != nil {
+		refSpec := config.RefSpec(fmt.Sprintf(":%s", plumbing.NewBranchReferenceName(branch)))
+		err := r.PushContext(ctx, &git.PushOptions{
+			RemoteName:    r.remote.Name,
+			ClientOptions: r.gitClientOptions,
+			RefSpecs:      []config.RefSpec{refSpec},
+		})
+		if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+			return fmt.Errorf("failed to delete remote branch: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (r *Repository) newFilesystem(hash plumbing.Hash) (_ *filesystem, err error) {
+	opts := []containers.Option[filesystemOption]{
+		withSignature(r.sigName, r.sigEmail),
+		withBaseCommit(hash),
+	}
+
+	if r.signer != nil {
+		opts = append(opts, withSigner(r.signer))
+	}
+
+	return newFilesystem(
+		r.logger,
+		r.Storer,
+		opts...,
+	)
+}
+
+// updateWorkingDirectory updates the working directory files to match the given commit
+func (r *Repository) updateWorkingDirectory(_ context.Context, commitHash plumbing.Hash) error {
+	if !r.isNormalRepo {
+		return nil // Only needed for normal repositories
+	}
+
+	// Get the worktree to update working directory
+	worktree, err := r.Repository.Worktree()
+	if err != nil {
+		return fmt.Errorf("getting worktree: %w", err)
+	}
+
+	// Checkout the commit to update working directory files
+	err = worktree.Checkout(&git.CheckoutOptions{
+		Hash: commitHash,
+	})
+	if err != nil {
+		return fmt.Errorf("checking out commit %s: %w", commitHash.String(), err)
+	}
+
+	r.logger.Debug("updated working directory to match commit",
+		zap.Stringer("commit", commitHash))
+	return nil
+}
+
+func WithRemote(name, url string) containers.Option[Repository] {
+	return func(r *Repository) {
+		r.remote = &config.RemoteConfig{
+			Name: "origin",
+			URLs: []string{url},
+		}
+	}
+}
+
+// WithDefaultBranch configures the default branch used to initially seed
+// the repo, or base other branches on when they're not already present
+// in the upstream.
+func WithDefaultBranch(ref string) containers.Option[Repository] {
+	return func(s *Repository) {
+		s.defaultBranch = ref
+	}
+}
+
+// WithAuth returns an option which configures the auth method used
+// by the provided source.
+func WithAuth(auth client.Option) containers.Option[Repository] {
+	return func(s *Repository) {
+		s.gitClientOptions = append(s.gitClientOptions, auth)
+	}
+}
+
+// WithInsecureTLS returns an option which configures the insecure TLS
+// setting for the provided source.
+func WithInsecureTLS(insecureSkipTLS bool) containers.Option[Repository] {
+	return func(s *Repository) {
+		if insecureSkipTLS {
+			s.gitClientOptions = append(s.gitClientOptions, client.WithInsecureSkipTLS())
+		}
+	}
+}
+
+// WithCABundle returns an option which configures the CA Bundle used for
+// validating the TLS connection to the provided source.
+func WithCABundle(caCertBytes []byte) containers.Option[Repository] {
+	return func(s *Repository) {
+		if caCertBytes != nil {
+			s.gitClientOptions = append(s.gitClientOptions, client.WithCABundle(caCertBytes))
+		}
+	}
+}
+
+// WithFilesystemStorage configures the Git repository to clone into
+// the local filesystem, instead of the default which is in-memory.
+// The provided path is location for the dotgit folder.
+func WithFilesystemStorage(path string) containers.Option[Repository] {
+	return func(r *Repository) {
+		r.localPath = path
+	}
+}
+
+// WithSignature sets the default signature name and email when the signature
+// cannot be derived from the request context.
+func WithSignature(name, email string) containers.Option[Repository] {
+	return func(r *Repository) {
+		r.sigName = name
+		r.sigEmail = email
+	}
+}
+
+// WithSigner sets the commit signer for signing Git commits.
+func WithSigner(signer signing.Signer) containers.Option[Repository] {
+	return func(r *Repository) {
+		r.signer = signer
+	}
+}
+
+// WithInterval sets the period between automatic fetches from the upstream (if a remote is configured)
+func WithInterval(interval time.Duration) containers.Option[Repository] {
+	return func(r *Repository) {
+		r.pollInterval = interval
+	}
+}
+
+// WithMaxOpenDescriptors sets the maximum number of open file descriptors when using filesystem backed storage
+func WithMaxOpenDescriptors(n int) containers.Option[Repository] {
+	return func(r *Repository) {
+		r.maxOpenDescriptors = n
+	}
+}
+
+// WithLenientFetchPolicy sets the lenient fetch policy which allows skip startup git fetch.
+func WithLenientFetchPolicy() containers.Option[Repository] {
+	return func(r *Repository) {
+		r.lenientFetchPolicyEnabled = true
+	}
+}
+
+const defaultReadmeContents = `Flipt Configuration Repository
+==============================
+
+This repository contains Flipt feature flag configuration.
+Each directory containing a file named features.yaml represents a namespace.`

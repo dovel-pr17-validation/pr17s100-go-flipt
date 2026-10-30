@@ -1,0 +1,48 @@
+name: Proto
+on:
+  push:
+    branches:
+      - v2
+    paths:
+      - "sdk/**"
+      - "rpc/**"
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - "sdk/**"
+      - "rpc/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  proto-lint:
+    name: "Lint Protos"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: bufbuild/buf-action@v1
+        with:
+          version: 1.71.0
+          lint: true
+
+  proto-check:
+    name: "Check Generated Code"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+
+      - uses: bufbuild/buf-action@v1
+        with:
+          version: 1.71.0
+          setup_only: true
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Proto
+        run: mise run proto
+
+      - name: Ensure clean git state.
+        run: git diff --quiet --exit-code sdk/ rpc/ || (echo "Please run 'mise run proto' and commit changes." && exit 1)

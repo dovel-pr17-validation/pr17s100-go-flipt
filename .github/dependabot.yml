@@ -1,0 +1,129 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    exclude-paths:
+      - "examples/**"
+      - "_tools/**"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+      aws-sdk-go-v2:
+        patterns:
+          - "github.com/aws/aws-sdk-go-v2/*"
+      grpc:
+        patterns:
+          - "google.golang.org/grpc*"
+          - "github.com/grpc-ecosystem/*"
+          - "google.golang.org/protobuf*"
+          - "google.golang.org/genproto*"
+      go-chi:
+        patterns:
+          - "github.com/go-chi/*"
+      azure-sdk-go:
+        patterns:
+          - "github.com/Azure/azure-sdk-for-go/*"
+          - "github.com/microsoft/azure-devops-go-api/*"
+      charmbracelet:
+        patterns:
+          - "github.com/charmbracelet/*"
+      prometheus:
+        patterns:
+          - "github.com/prometheus/*"
+      redis:
+        patterns:
+          - "github.com/redis/go-redis/*"
+      go-git:
+        patterns:
+          - "github.com/go-git/go-git*"
+          - "github.com/go-git/go-billy*"
+      go-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      # Catch-all for anything not matched by a named group above.
+      go-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+      - dependency-name: github.com/golangci/golangci-lint
+        versions:
+          - "> 1.26.0"
+    labels:
+      - "dependencies"
+      - "go"
+      # kodiak `merge.automerge_label`
+      - "automerge"
+
+  - package-ecosystem: npm
+    directory: "/ui"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+    labels:
+      - "dependencies"
+      - "javascript"
+      # kodiak `merge.automerge_label`
+      - "automerge"
+    groups:
+      radix-ui:
+        patterns:
+          - "@radix-ui/*"
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "react-error-boundary"
+          - "@types/react"
+          - "@types/react-dom"
+      codemirror:
+        patterns:
+          - "@codemirror/*"
+          - "@uiw/react-codemirror"
+          - "@uiw/codemirror-theme-tokyo-night"
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      # Catch-all for anything not matched by a named group above.
+      npm-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "github-actions"
+    # Workflow files stored in the
+    # default location of `.github/workflows`
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github_actions"
+      # kodiak `merge.automerge_label`
+      - "automerge"
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: "docker"
+    directory: "/build"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "docker"
+      # kodiak `merge.automerge_label`
+      - "automerge"

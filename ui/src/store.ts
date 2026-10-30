@@ -1,0 +1,227 @@
+import {
+  UnknownAction,
+  configureStore,
+  createListenerMiddleware,
+  isAnyOf
+} from '@reduxjs/toolkit';
+
+import { authProvidersApi } from '~/app/auth/authApi';
+import {
+  environmentKey,
+  environmentsApi,
+  environmentsSlice,
+  revisionChanged
+} from '~/app/environments/environmentsApi';
+import { eventKey, eventSlice } from '~/app/events/eventSlice';
+import { analyticsApi } from '~/app/flags/analyticsApi';
+import { flagsApi, flagsTableSlice } from '~/app/flags/flagsApi';
+import { eventReceived, streamingReducer } from '~/app/flags/streamingApi';
+import { metaSlice } from '~/app/meta/metaSlice';
+import {
+  namespaceApi,
+  namespaceKey,
+  namespacesSlice
+} from '~/app/namespaces/namespacesApi';
+import {
+  preferencesKey,
+  preferencesSlice
+} from '~/app/preferences/preferencesSlice';
+import { segmentsApi, segmentsTableSlice } from '~/app/segments/segmentsApi';
+
+import { LoadingStatus } from '~/types/Meta';
+
+const listenerMiddleware = createListenerMiddleware();
+
+listenerMiddleware.startListening({
+  matcher: isAnyOf(
+    eventSlice.actions.onboardingCompleted,
+    eventSlice.actions.proBannerDismissed
+  ),
+  effect: (_action, api) => {
+    // save to local storage
+    localStorage.setItem(
+      eventKey,
+      JSON.stringify((api.getState() as RootState).user)
+    );
+  }
+});
+
+listenerMiddleware.startListening({
+  matcher: isAnyOf(
+    preferencesSlice.actions.themeChanged,
+    preferencesSlice.actions.timezoneChanged
+  ),
+  effect: (_action, api) => {
+    // save to local storage
+    localStorage.setItem(
+      preferencesKey,
+      JSON.stringify((api.getState() as RootState).preferences)
+    );
+  }
+});
+
+listenerMiddleware.startListening({
+  matcher: isAnyOf(environmentsSlice.actions.currentEnvironmentChanged),
+  effect: (_action, api) => {
+    // save to local storage
+    localStorage.setItem(
+      environmentKey,
+      (api.getState() as RootState).environments.currentEnvironment
+    );
+  }
+});
+
+listenerMiddleware.startListening({
+  matcher: isAnyOf(namespacesSlice.actions.currentNamespaceChanged),
+  effect: (_action, api) => {
+    // save to local storage
+    const ns = (api.getState() as RootState).namespaces.currentNamespace;
+    if (ns) {
+      localStorage.setItem(namespaceKey, ns);
+    } else {
+      localStorage.removeItem(namespaceKey);
+    }
+  }
+});
+
+/*
+ * Each time the the app is loaded or environments changed by user this
+ * listener will propagate the latest environments to the environmentsSlice.
+ */
+listenerMiddleware.startListening({
+  matcher: environmentsApi.endpoints.listEnvironments.matchFulfilled,
+  effect: (action, api) => {
+    api.dispatch(environmentsSlice.actions.environmentsChanged(action.payload));
+  }
+});
+
+/*
+ * Each time the the app is loaded or namespaces changed by user this
+ * listener will propagate the latest namespaces to the namespacesSlice.
+ */
+listenerMiddleware.startListening({
+  matcher: namespaceApi.endpoints.listNamespaces.matchFulfilled,
+  effect: (action, api) => {
+    api.dispatch(namespacesSlice.actions.namespacesChanged(action.payload));
+  }
+});
+
+listenerMiddleware.startListening({
+  predicate: (
+    action
+  ): action is UnknownAction & {
+    meta: {
+      arg: { originalArgs: { environmentKey?: string } };
+      baseQueryMeta?: { revision?: string };
+    };
+  } =>
+    namespaceApi.endpoints.listNamespaces.matchFulfilled(action) ||
+    flagsApi.endpoints.listFlags.matchFulfilled(action) ||
+    flagsApi.endpoints.getFlag.matchFulfilled(action) ||
+    segmentsApi.endpoints.listSegments.matchFulfilled(action) ||
+    segmentsApi.endpoints.getSegment.matchFulfilled(action),
+  effect: (action, api) => {
+    const environmentKey = action.meta?.arg.originalArgs.environmentKey;
+    const revision = action.meta?.baseQueryMeta?.revision;
+    if (environmentKey && revision) {
+      api.dispatch(revisionChanged({ environmentKey, revision }));
+    }
+  }
+});
+
+/*
+ * Invalidate flags and segments cache when streaming events are received.
+ */
+listenerMiddleware.startListening({
+  matcher: (action): action is ReturnType<typeof eventReceived> =>
+    eventReceived.match(action),
+  effect: (action, api) => {
+    const eventData = action.payload.data as {
+      type?: string;
+      etag?: string;
+      envKey?: string;
+      nsKey?: string;
+    } | null;
+
+    if (eventData?.type !== 'refetchEvaluation') {
+      console.warn('unexpected sse event', eventData);
+      return;
+    }
+
+    const envKey = eventData.envKey ?? 'default';
+    const nsKey = eventData.nsKey ?? 'default';
+    const tagId = envKey + '/' + nsKey;
+
+    api.dispatch(flagsApi.util.invalidateTags([{ type: 'Flag', id: tagId }]));
+
+    api.dispatch(
+      segmentsApi.util.invalidateTags([{ type: 'Segment', id: tagId }])
+    );
+  }
+});
+
+const userState = JSON.parse(localStorage.getItem(eventKey) || '{}');
+
+const preferencesState = JSON.parse(
+  localStorage.getItem(preferencesKey) || '{}'
+);
+
+const currentEnvironment = localStorage.getItem(environmentKey) || 'default';
+const currentNamespace = localStorage.getItem(namespaceKey) || 'default';
+
+export const store = configureStore({
+  preloadedState: {
+    user: userState,
+    preferences: preferencesState,
+    environments: {
+      environments: {},
+      status: LoadingStatus.IDLE,
+      currentEnvironment,
+      revision: 'unknown',
+      error: undefined
+    },
+    namespaces: {
+      namespaces: {},
+      status: LoadingStatus.IDLE,
+      currentNamespace,
+      error: undefined
+    },
+    flagsTable: {
+      sorting: []
+    },
+    segmentsTable: {
+      sorting: []
+    }
+  },
+  reducer: {
+    flagsTable: flagsTableSlice.reducer,
+    segmentsTable: segmentsTableSlice.reducer,
+    user: eventSlice.reducer,
+    preferences: preferencesSlice.reducer,
+    environments: environmentsSlice.reducer,
+    namespaces: namespacesSlice.reducer,
+    meta: metaSlice.reducer,
+    streaming: streamingReducer,
+    [environmentsApi.reducerPath]: environmentsApi.reducer,
+    [namespaceApi.reducerPath]: namespaceApi.reducer,
+    [flagsApi.reducerPath]: flagsApi.reducer,
+    [segmentsApi.reducerPath]: segmentsApi.reducer,
+    [authProvidersApi.reducerPath]: authProvidersApi.reducer,
+    [analyticsApi.reducerPath]: analyticsApi.reducer
+  },
+  middleware: (getDefaultMiddleware) =>
+    getDefaultMiddleware()
+      .prepend(listenerMiddleware.middleware)
+      .concat(
+        environmentsApi.middleware,
+        namespaceApi.middleware,
+        flagsApi.middleware,
+        segmentsApi.middleware,
+        authProvidersApi.middleware,
+        analyticsApi.middleware
+      )
+});
+
+// Infer the `RootState` and `AppDispatch` types from the store itself
+export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;

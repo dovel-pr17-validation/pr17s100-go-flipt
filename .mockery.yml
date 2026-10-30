@@ -1,0 +1,49 @@
+dir: "{{.InterfaceDir}}"
+structname: Mock{{.InterfaceName}}
+pkgname: "{{.SrcPackageName}}"
+filename: "{{.SrcPackageName}}_mock.go"
+template: testify
+packages:
+  go.flipt.io/flipt/internal/server/environments:
+    interfaces:
+      Environment: {}
+  go.flipt.io/flipt/internal/server/evaluation:
+    interfaces:
+      EnvironmentStore: {}
+  go.flipt.io/flipt/internal/storage:
+    interfaces:
+      ReadOnlyStore: {}
+  go.flipt.io/flipt/internal/server/analytics/prometheus:
+    interfaces:
+      PrometheusClient: {}
+  go.flipt.io/flipt/internal/server/analytics:
+    interfaces:
+      Client: {}
+  go.flipt.io/flipt/internal/coss/storage/environments/git/github:
+    interfaces:
+      PullRequestsService: {}
+      RepositoriesService: {}
+  go.flipt.io/flipt/internal/coss/storage/environments/git/gitea:
+    interfaces:
+      Client: {}
+  go.flipt.io/flipt/internal/coss/storage/environments/git/gitlab:
+    interfaces:
+      MergeRequestsService: {}
+      RepositoriesService: {}
+  go.flipt.io/flipt/internal/coss/storage/environments/git/azure:
+    interfaces:
+      Client: {}
+  go.flipt.io/flipt/internal/coss/storage/environments/git/bitbucket:
+    interfaces:
+      PullRequestsService: {}
+      CommitsService: {}
+  go.flipt.io/flipt/internal/coss/license:
+    interfaces:
+      Manager: {}
+  go.flipt.io/flipt/internal/coss/webhook:
+    interfaces:
+      Repository: {}
+  go.flipt.io/flipt/internal/secrets:
+    interfaces:
+      Provider: {}
+      Manager: {}

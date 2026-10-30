@@ -1,0 +1,10 @@
+version: v2
+plugins:
+  - remote: buf.build/community/google-gnostic-openapi:v0.7.0
+    out: evaluation
+    opt:
+      - paths=source_relative
+      - fq_schema_naming=false
+      - default_response=false
+      - enum_type=string
+      - description=

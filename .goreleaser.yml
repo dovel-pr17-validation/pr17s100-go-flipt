@@ -1,0 +1,111 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema-pro.json
+version: 2
+
+project_name: flipt
+
+git:
+  tag_sort: semver
+
+monorepo:
+  tag_prefix: v
+
+builds:
+  - builder: prebuilt
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    goamd64:
+      - v1
+    goarm64:
+      - v8.0
+    prebuilt:
+      path: tmp/dist/flipt_{{ .Os }}_{{ .Arch }}{{ with .Amd64 }}_{{ . }}{{ end }}{{ with .Arm64 }}_{{ . }}{{ end }}/flipt
+    binary: flipt
+
+sboms:
+  - artifacts: archive
+
+archives:
+  - id: main
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- tolower .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - LICENSE
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  prerelease: auto # enable rc releases (e.g. v1.0.0-rc.1)
+  target_commitish: "{{ .Commit }}"
+  footer: |
+    ## Installation
+    ### Docker Images :whale:
+    ```bash
+      docker pull docker.flipt.io/flipt/flipt:v{{ .Tag }}
+    ```
+    ```bash
+      docker pull ghcr.io/flipt-io/flipt:v{{ .Tag }}
+    ```
+    ## Thank you!
+    We hope you :heart: this release! Feel free to open issues/discussions or reach out to us on Discord if you have any questions or feedback.
+    - [Discord](https://flipt.io/discord)
+    - [Github Discussions](https://github.com/flipt-io/flipt/discussions)
+    - [Github Issues](https://github.com/flipt-io/flipt/issues)
+    - [Website](https://flipt.io)
+
+changelog:
+  use: github
+  format: "{{.SHA}}: {{.Message}} (@{{.AuthorUsername}})"
+  sort: asc
+  groups:
+    - title: "Features"
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: "Bug Fixes"
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: "Dependencies"
+      regexp: '^.*?deps(\([[:word:]]+\))??!?:.+$'
+      order: 999
+    - title: "Other"
+      order: 3
+
+dockers_v2:
+  - dockerfile: ./build/Dockerfile
+    images:
+      - "flipt/flipt"
+      - "ghcr.io/flipt-io/flipt"
+    tags:
+      - "v{{ .Tag }}"
+      - "v{{ .Major }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      "org.opencontainers.image.created": "{{.Date}}"
+      "org.opencontainers.image.revision": "{{.FullCommit}}"
+      "org.opencontainers.image.version": "{{.Version}}"
+
+announce:
+  discord:
+    enabled: true
+
+homebrew_casks:
+  - name: flipt@2
+    homepage: https://flipt.io
+    description: A Git-first, CloudNative feature management solution
+    directory: Casks
+    skip_upload: auto
+    binaries:
+      - flipt
+    repository:
+      owner: flipt-io
+      name: homebrew-brew
+      branch: main

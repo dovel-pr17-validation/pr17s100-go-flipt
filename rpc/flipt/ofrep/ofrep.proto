@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package flipt.ofrep;
+
+import "gnostic/openapi/v3/annotations.proto";
+import "google/api/annotations.proto";
+import "google/api/field_behavior.proto";
+import "google/api/visibility.proto";
+import "google/protobuf/struct.proto";
+
+option go_package = "go.flipt.io/flipt/rpc/flipt/ofrep";
+
+message EvaluateFlagRequest {
+  string key = 1;
+  map<string, string> context = 2;
+}
+
+message EvaluationResponse {
+  string key = 1;
+  EvaluateReason reason = 2;
+  string variant = 3;
+  google.protobuf.Struct metadata = 4;
+  google.protobuf.Value value = 5;
+}
+
+enum EvaluateReason {
+  UNKNOWN = 0;
+  DISABLED = 1;
+  TARGETING_MATCH = 2;
+  DEFAULT = 3;
+}
+
+message EvaluateBulkRequest {
+  map<string, string> context = 2;
+}
+
+message EventStreamEndpoint {
+  // The path + query portion of the endpoint URL. Must start with `/`.
+  string request_uri = 1 [(google.api.field_behavior) = REQUIRED];
+  // The scheme + host + optional port portion of the endpoint URL.
+  optional string origin = 2 [(google.api.field_behavior) = OPTIONAL];
+}
+
+// A real-time change notification connection endpoint
+message EventStream {
+  // The connection type identifying the push mechanism to use
+  string type = 1 [(google.api.field_behavior) = IMMUTABLE];
+  // The endpoint URL the client should connect to for real-time flag change notifications
+  EventStreamEndpoint endpoint = 2 [(google.api.field_behavior) = REQUIRED];
+}
+
+message BulkEvaluationResponse {
+  repeated EvaluationResponse flags = 1 [(google.api.field_behavior) = REQUIRED];
+  // The array of real-time change notification connections
+  repeated EventStream event_streams = 2 [(google.api.field_behavior) = OPTIONAL];
+}
+
+service OFREPService {
+  option (google.api.api_visibility) = {restriction: "flipt:sdk:ignore"};
+  // OFREP single flag evaluation
+  rpc EvaluateFlag(EvaluateFlagRequest) returns (EvaluationResponse) {
+    option (google.api.http) = {
+      post: "/ofrep/v1/evaluate/flags/{key}"
+      body: "*"
+    };
+    option (gnostic.openapi.v3.operation) = {operation_id: "ofrep.evaluateFlag"};
+  }
+  // OFREP bulk flag evaluation
+  rpc EvaluateBulk(EvaluateBulkRequest) returns (BulkEvaluationResponse) {
+    option (google.api.http) = {
+      post: "/ofrep/v1/evaluate/flags"
+      body: "*"
+    };
+    option (gnostic.openapi.v3.operation) = {operation_id: "ofrep.evaluateFlagsBulk"};
+  }
+}

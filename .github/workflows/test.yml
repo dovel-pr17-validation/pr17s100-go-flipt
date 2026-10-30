@@ -1,0 +1,123 @@
+name: Unit Tests
+on:
+  push:
+    branches:
+      - v2
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DAGGER_NO_NAG: "1"
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.head_ref || github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      go: ${{ steps.changes.outputs.go }}
+      ui: ${{ steps.changes.outputs.ui }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github
+      - id: changes
+        uses: ./.github/actions/changes
+
+  test:
+    name: "Tests (Go)"
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.go != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+
+      - name: Run Unit Tests
+        uses: dagger/dagger-for-github@v7
+        with:
+          verb: call
+          version: ${{ steps.mise_versions.outputs.dagger }}
+          args: test --source . unit export --path coverage.txt
+
+      - name: Upload Coverage
+        uses: codecov/codecov-action@v7
+        with:
+          file: coverage.txt
+          flags: unittests
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  test-darwin:
+    name: "Tests (Go - Darwin)"
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.go != 'false' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+
+      - name: Unit Test SQLite
+        env:
+          FLIPT_TEST_SHORT: "true"
+        run: go test -v -count=1 -timeout=60s -short ./...
+
+  ui:
+    name: "Tests (UI)"
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.ui != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+
+      - name: Unit Test
+        run: |
+          npm ci
+          npm run test
+        working-directory: ui
+
+  install:
+    name: "Test Install Script"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Shellcheck
+        uses: reviewdog/action-shellcheck@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-review
+          path: install.sh
+
+      - name: Install
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x ./install.sh
+          ./install.sh
+
+  # Single required status check for this workflow, so branch protection
+  # doesn't track each test job by name. Fails if any Go, UI, or install
+  # script job failed; jobs skipped by change detection pass.
+  result:
+    name: "Unit Tests Result"
+    if: always()
+    needs: [changes, test, test-darwin, ui, install]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check job results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' > /dev/null

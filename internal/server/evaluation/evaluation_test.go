@@ -1,0 +1,3030 @@
+package evaluation
+
+import (
+	"context"
+	"errors"
+	"os"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	errs "go.flipt.io/flipt/errors"
+	"go.flipt.io/flipt/internal/server/environments"
+	"go.flipt.io/flipt/internal/server/tracing"
+	"go.flipt.io/flipt/internal/storage"
+	"go.flipt.io/flipt/rpc/flipt"
+	"go.flipt.io/flipt/rpc/flipt/core"
+	rpcevaluation "go.flipt.io/flipt/rpc/flipt/evaluation"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.uber.org/zap/zaptest"
+)
+
+var testMetricReader *sdkmetric.ManualReader
+
+func TestMain(m *testing.M) {
+	testMetricReader = sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(testMetricReader))
+	otel.SetMeterProvider(mp)
+	os.Exit(m.Run())
+}
+
+func collectMetrics(t *testing.T) metricdata.ResourceMetrics {
+	t.Helper()
+	var data metricdata.ResourceMetrics
+	require.NoError(t, testMetricReader.Collect(t.Context(), &data))
+	return data
+}
+
+func metricCounterValue(t *testing.T, data *metricdata.ResourceMetrics, name string) int64 {
+	t.Helper()
+	for _, sm := range data.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == name {
+				if sum, ok := m.Data.(metricdata.Sum[int64]); ok {
+					var total int64
+					for _, dp := range sum.DataPoints {
+						total += dp.Value
+					}
+					return total
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func metricCounterValueDelta(t *testing.T, metricName string, before, after *metricdata.ResourceMetrics) int64 {
+	t.Helper()
+	return metricCounterValue(t, after, metricName) - metricCounterValue(t, before, metricName)
+}
+
+// prepareSegments calls PrepareForEvaluation on every constraint in the map,
+// mirroring what NewEvaluationSegment does in production.
+func prepareSegments(t *testing.T, segments map[string]*storage.EvaluationSegment) map[string]*storage.EvaluationSegment {
+	t.Helper()
+	for _, seg := range segments {
+		for i := range seg.Constraints {
+			require.NoError(t, seg.Constraints[i].PrepareForEvaluation())
+		}
+	}
+	return segments
+}
+
+func TestVariant_FlagNotFound(t *testing.T) {
+	var (
+		flagKey      = "test-flag"
+		namespaceKey = "test-namespace"
+		envStore     = NewMockEnvironmentStore(t)
+		environment  = environments.NewMockEnvironment(t)
+		store        = storage.NewMockReadOnlyStore(t)
+		logger       = zaptest.NewLogger(t)
+		s            = New(logger, envStore)
+	)
+
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{}, errs.ErrNotFound("test-flag"))
+
+	res, err := s.Variant(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.Nil(t, res)
+
+	assert.EqualError(t, err, "test-flag not found")
+}
+
+func TestVariant_NonVariantFlag(t *testing.T) {
+	var (
+		flagKey      = "test-flag"
+		namespaceKey = "test-namespace"
+		envStore     = NewMockEnvironmentStore(t)
+		environment  = environments.NewMockEnvironment(t)
+		store        = storage.NewMockReadOnlyStore(t)
+		logger       = zaptest.NewLogger(t)
+		s            = New(logger, envStore)
+	)
+
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+	}, nil)
+
+	res, err := s.Variant(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.Nil(t, res)
+	assert.EqualError(t, err, "flag type BOOLEAN_FLAG_TYPE invalid")
+}
+
+func TestVariant_FlagDisabled(t *testing.T) {
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: false,
+		Type:    core.FlagType_VARIANT_FLAG_TYPE,
+	}, nil)
+
+	res, err := s.Variant(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.NoError(t, err)
+	assert.False(t, res.Match)
+	assert.Equal(t, rpcevaluation.EvaluationReason_FLAG_DISABLED_EVALUATION_REASON, res.Reason)
+}
+
+func TestVariant_EvaluateFailure_OnGetEvaluationRules(t *testing.T) {
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+		flag           = &core.Flag{
+			Key:     flagKey,
+			Enabled: true,
+			Type:    core.FlagType_VARIANT_FLAG_TYPE,
+		}
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(flag, nil)
+	store.On("GetEvaluationRules", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRule{}, errs.ErrInvalid("some invalid error"))
+
+	res, err := s.Variant(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.Nil(t, res)
+	assert.EqualError(t, err, "some invalid error")
+}
+
+func TestVariant_Success(t *testing.T) {
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+		flag           = &core.Flag{
+			Key:     flagKey,
+			Enabled: true,
+			Type:    core.FlagType_VARIANT_FLAG_TYPE,
+		}
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(flag, nil)
+
+	store.On("GetEvaluationRules", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(
+		[]*storage.EvaluationRule{
+			{
+				ID:      "1",
+				FlagKey: flagKey,
+				Rank:    0,
+				Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+					"bar": {
+						SegmentKey: "bar",
+						MatchType:  core.MatchType_ALL_MATCH_TYPE,
+						Constraints: []storage.EvaluationConstraint{
+							{
+								ID:       "2",
+								Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+								Property: "hello",
+								Operator: flipt.OpEQ,
+								Value:    "world",
+							},
+						},
+					},
+				}),
+			},
+		}, nil,
+	)
+
+	store.On(
+		"GetEvaluationDistributions",
+		mock.Anything,
+		storage.NewResource(namespaceKey, flagKey),
+		storage.NewID("1"),
+	).Return([]*storage.EvaluationDistribution{}, nil)
+
+	res, err := s.Variant(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.NoError(t, err)
+	assert.True(t, res.Match)
+	assert.Contains(t, res.SegmentKeys, "bar")
+	assert.Equal(t, rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON, res.Reason)
+}
+
+func TestVariant_MatchConstraintsError_WithMetrics(t *testing.T) {
+	baseline := collectMetrics(t)
+
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_VARIANT_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRules", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(
+		[]*storage.EvaluationRule{
+			{
+				ID:      "1",
+				FlagKey: flagKey,
+				Rank:    0,
+				Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+					"bar": {
+						SegmentKey: "bar",
+						MatchType:  core.MatchType_ALL_MATCH_TYPE,
+						Constraints: []storage.EvaluationConstraint{
+							{
+								ID:       "2",
+								Type:     core.ComparisonType_UNKNOWN_COMPARISON_TYPE,
+								Property: "hello",
+								Operator: flipt.OpEQ,
+								Value:    "world",
+							},
+						},
+					},
+				}),
+			},
+		}, nil,
+	)
+
+	res, err := s.Variant(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.Nil(t, res)
+	require.EqualError(t, err, "unknown constraint type")
+
+	data := collectMetrics(t)
+	assert.Equal(t, int64(1), metricCounterValueDelta(t, "flipt_evaluations_errors", &baseline, &data))
+	assert.Equal(t, int64(0), metricCounterValueDelta(t, "flipt_evaluations_results", &baseline, &data))
+}
+
+func TestVariant_GetEvaluationDistributionsError_WithMetrics(t *testing.T) {
+	baseline := collectMetrics(t)
+
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_VARIANT_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRules", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(
+		[]*storage.EvaluationRule{
+			{
+				ID:      "1",
+				FlagKey: flagKey,
+				Rank:    0,
+				Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+					"bar": {
+						SegmentKey: "bar",
+						MatchType:  core.MatchType_ALL_MATCH_TYPE,
+						Constraints: []storage.EvaluationConstraint{
+							{
+								ID:       "2",
+								Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+								Property: "hello",
+								Operator: flipt.OpEQ,
+								Value:    "world",
+							},
+						},
+					},
+				}),
+			},
+		}, nil,
+	)
+
+	store.On(
+		"GetEvaluationDistributions",
+		mock.Anything,
+		storage.NewResource(namespaceKey, flagKey),
+		storage.NewID("1"),
+	).Return(nil, errors.New("distribution error"))
+
+	res, err := s.Variant(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.Nil(t, res)
+	require.EqualError(t, err, "distribution error")
+
+	data := collectMetrics(t)
+	assert.Equal(t, int64(1), metricCounterValueDelta(t, "flipt_evaluations_errors", &baseline, &data))
+	assert.Equal(t, int64(0), metricCounterValueDelta(t, "flipt_evaluations_results", &baseline, &data))
+}
+
+func TestBoolean_FlagNotFoundError(t *testing.T) {
+	var (
+		flagKey      = "test-flag"
+		namespaceKey = "test-namespace"
+		envStore     = NewMockEnvironmentStore(t)
+		environment  = environments.NewMockEnvironment(t)
+		store        = storage.NewMockReadOnlyStore(t)
+		logger       = zaptest.NewLogger(t)
+		s            = New(logger, envStore, WithMetrics(true))
+	)
+
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{}, errs.ErrNotFound("test-flag"))
+
+	res, err := s.Boolean(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.Nil(t, res)
+	require.EqualError(t, err, "test-flag not found")
+}
+
+func TestBoolean_NonBooleanFlagError(t *testing.T) {
+	var (
+		flagKey      = "test-flag"
+		namespaceKey = "test-namespace"
+		envStore     = NewMockEnvironmentStore(t)
+		environment  = environments.NewMockEnvironment(t)
+		store        = storage.NewMockReadOnlyStore(t)
+		logger       = zaptest.NewLogger(t)
+		s            = New(logger, envStore, WithMetrics(true))
+	)
+
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_VARIANT_FLAG_TYPE,
+	}, nil)
+
+	res, err := s.Boolean(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.Nil(t, res)
+	assert.EqualError(t, err, "flag type VARIANT_FLAG_TYPE invalid")
+}
+
+func TestBoolean_DefaultRule_NoRollouts(t *testing.T) {
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRollout{}, nil)
+
+	res, err := s.Boolean(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.NoError(t, err)
+	assert.True(t, res.Enabled)
+	assert.Equal(t, rpcevaluation.EvaluationReason_DEFAULT_EVALUATION_REASON, res.Reason)
+	assert.Equal(t, flagKey, res.FlagKey)
+}
+
+func TestBoolean_FlagDisabled_NoRollouts(t *testing.T) {
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: false,
+		Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRollout{}, nil)
+
+	res, err := s.Boolean(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.NoError(t, err)
+	assert.False(t, res.Enabled)
+	assert.Equal(t, rpcevaluation.EvaluationReason_FLAG_DISABLED_EVALUATION_REASON, res.Reason)
+	assert.Equal(t, flagKey, res.FlagKey)
+}
+
+func TestBoolean_DefaultRuleFallthrough_WithPercentageRollout(t *testing.T) {
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRollout{
+		{
+			NamespaceKey: namespaceKey,
+			Rank:         1,
+			RolloutType:  core.RolloutType_THRESHOLD_ROLLOUT_TYPE,
+			Threshold: &storage.RolloutThreshold{
+				Percentage: 5,
+				Value:      false,
+			},
+		},
+	}, nil)
+
+	res, err := s.Boolean(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.NoError(t, err)
+	assert.True(t, res.Enabled)
+	assert.Equal(t, rpcevaluation.EvaluationReason_DEFAULT_EVALUATION_REASON, res.Reason)
+	assert.Equal(t, flagKey, res.FlagKey)
+}
+
+func TestBoolean_PercentageRuleMatch(t *testing.T) {
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRollout{
+		{
+			NamespaceKey: namespaceKey,
+			Rank:         1,
+			RolloutType:  core.RolloutType_THRESHOLD_ROLLOUT_TYPE,
+			Threshold: &storage.RolloutThreshold{
+				Percentage: 70,
+				Value:      false,
+			},
+		},
+	}, nil)
+
+	res, err := s.Boolean(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.NoError(t, err)
+	assert.False(t, res.Enabled)
+	assert.Equal(t, rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON, res.Reason)
+	assert.Equal(t, flagKey, res.FlagKey)
+}
+
+func TestBoolean_PercentageRuleFallthrough_SegmentMatch(t *testing.T) {
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRollout{
+		{
+			NamespaceKey: namespaceKey,
+			RolloutType:  core.RolloutType_THRESHOLD_ROLLOUT_TYPE,
+			Rank:         1,
+			Segment: &storage.RolloutSegment{
+				Value:           true,
+				SegmentOperator: core.SegmentOperator_OR_SEGMENT_OPERATOR,
+				Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+					"test-segment": {
+						SegmentKey: "test-segment",
+						MatchType:  core.MatchType_ANY_MATCH_TYPE,
+						Constraints: []storage.EvaluationConstraint{
+							{
+								Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+								Property: "hello",
+								Operator: flipt.OpEQ,
+								Value:    "world",
+							},
+						},
+					},
+				}),
+			},
+		},
+		{
+			NamespaceKey: namespaceKey,
+			RolloutType:  core.RolloutType_SEGMENT_ROLLOUT_TYPE,
+			Rank:         2,
+			Segment: &storage.RolloutSegment{
+				Value:           true,
+				SegmentOperator: core.SegmentOperator_OR_SEGMENT_OPERATOR,
+				Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+					"test-segment": {
+						SegmentKey: "test-segment",
+						MatchType:  core.MatchType_ANY_MATCH_TYPE,
+						Constraints: []storage.EvaluationConstraint{
+							{
+								Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+								Property: "hello",
+								Operator: flipt.OpEQ,
+								Value:    "world",
+							},
+						},
+					},
+				}),
+			},
+		},
+	}, nil)
+
+	res, err := s.Boolean(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.NoError(t, err)
+	assert.True(t, res.Enabled)
+	assert.Equal(t, rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON, res.Reason)
+	assert.Equal(t, flagKey, res.FlagKey)
+	assert.Equal(t, []string{"test-segment"}, res.SegmentKeys)
+}
+
+func TestBoolean_SegmentMatch_MultipleConstraints(t *testing.T) {
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRollout{
+		{
+			NamespaceKey: namespaceKey,
+			RolloutType:  core.RolloutType_SEGMENT_ROLLOUT_TYPE,
+			Rank:         1,
+			Segment: &storage.RolloutSegment{
+				Value:           true,
+				SegmentOperator: core.SegmentOperator_OR_SEGMENT_OPERATOR,
+				Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+					"test-segment": {
+						SegmentKey: "test-segment",
+						MatchType:  core.MatchType_ANY_MATCH_TYPE,
+						Constraints: []storage.EvaluationConstraint{
+							{
+								Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+								Property: "pitimes100",
+								Operator: flipt.OpEQ,
+								Value:    "314",
+							},
+							{
+								Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+								Property: "hello",
+								Operator: flipt.OpEQ,
+								Value:    "world",
+							},
+						},
+					},
+				}),
+			},
+		},
+	}, nil)
+
+	res, err := s.Boolean(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.NoError(t, err)
+	assert.True(t, res.Enabled)
+	assert.Equal(t, rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON, res.Reason)
+	assert.Equal(t, flagKey, res.FlagKey)
+}
+
+func TestBoolean_SegmentMatch_Constraint_EntityId(t *testing.T) {
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRollout{
+		{
+			NamespaceKey: namespaceKey,
+			RolloutType:  core.RolloutType_SEGMENT_ROLLOUT_TYPE,
+			Rank:         1,
+			Segment: &storage.RolloutSegment{
+				Value:           true,
+				SegmentOperator: core.SegmentOperator_OR_SEGMENT_OPERATOR,
+				Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+					"test-segment": {
+						SegmentKey: "test-segment",
+						MatchType:  core.MatchType_ANY_MATCH_TYPE,
+						Constraints: []storage.EvaluationConstraint{
+							{
+								Type:     core.ComparisonType_ENTITY_ID_COMPARISON_TYPE,
+								Property: "entity",
+								Operator: flipt.OpEQ,
+								Value:    "user@core.io",
+							},
+						},
+					},
+				}),
+			},
+		},
+	}, nil)
+
+	res, err := s.Boolean(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "user@core.io",
+		NamespaceKey: namespaceKey,
+		Context:      map[string]string{},
+	})
+
+	require.NoError(t, err)
+	assert.True(t, res.Enabled)
+	assert.Equal(t, rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON, res.Reason)
+	assert.Equal(t, flagKey, res.FlagKey)
+}
+
+func TestBoolean_SegmentMatch_MultipleSegments_WithAnd(t *testing.T) {
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRollout{
+		{
+			NamespaceKey: namespaceKey,
+			RolloutType:  core.RolloutType_SEGMENT_ROLLOUT_TYPE,
+			Rank:         1,
+			Segment: &storage.RolloutSegment{
+				Value:           true,
+				SegmentOperator: core.SegmentOperator_AND_SEGMENT_OPERATOR,
+				Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+					"test-segment": {
+						SegmentKey: "test-segment",
+						MatchType:  core.MatchType_ANY_MATCH_TYPE,
+						Constraints: []storage.EvaluationConstraint{
+							{
+								Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+								Property: "pitimes100",
+								Operator: flipt.OpEQ,
+								Value:    "314",
+							},
+						},
+					},
+					"another-segment": {
+						SegmentKey: "another-segment",
+						MatchType:  core.MatchType_ANY_MATCH_TYPE,
+						Constraints: []storage.EvaluationConstraint{
+							{
+								Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+								Property: "hello",
+								Operator: flipt.OpEQ,
+								Value:    "world",
+							},
+						},
+					},
+				}),
+			},
+		},
+	}, nil)
+
+	res, err := s.Boolean(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello":      "world",
+			"pitimes100": "314",
+		},
+	})
+
+	require.NoError(t, err)
+	assert.True(t, res.Enabled)
+	assert.Equal(t, rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON, res.Reason)
+	assert.Equal(t, flagKey, res.FlagKey)
+}
+
+func TestBoolean_RulesOutOfOrder(t *testing.T) {
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRollout{
+		{
+			NamespaceKey: namespaceKey,
+			Rank:         1,
+			RolloutType:  core.RolloutType_THRESHOLD_ROLLOUT_TYPE,
+			Threshold: &storage.RolloutThreshold{
+				Percentage: 5,
+				Value:      false,
+			},
+		},
+		{
+			NamespaceKey: namespaceKey,
+			RolloutType:  core.RolloutType_SEGMENT_ROLLOUT_TYPE,
+			Rank:         0,
+			Segment: &storage.RolloutSegment{
+				Value:           true,
+				SegmentOperator: core.SegmentOperator_OR_SEGMENT_OPERATOR,
+				Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+					"test-segment": {
+						SegmentKey: "test-segment",
+						MatchType:  core.MatchType_ANY_MATCH_TYPE,
+						Constraints: []storage.EvaluationConstraint{
+							{
+								Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+								Property: "hello",
+								Operator: flipt.OpEQ,
+								Value:    "world",
+							},
+						},
+					},
+				}),
+			},
+		},
+	}, nil)
+
+	res, err := s.Boolean(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.Nil(t, res)
+	assert.EqualError(t, err, "rollout rank: 0 detected out of order")
+}
+
+func TestBoolean_MatchConstraintsError_WithMetrics(t *testing.T) {
+	baseline := collectMetrics(t)
+
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRollout{
+		{
+			NamespaceKey: namespaceKey,
+			Rank:         1,
+			RolloutType:  core.RolloutType_SEGMENT_ROLLOUT_TYPE,
+			Segment: &storage.RolloutSegment{
+				Value:           true,
+				SegmentOperator: core.SegmentOperator_OR_SEGMENT_OPERATOR,
+				Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+					"test-segment": {
+						SegmentKey: "test-segment",
+						MatchType:  core.MatchType_ANY_MATCH_TYPE,
+						Constraints: []storage.EvaluationConstraint{
+							{
+								Type:     core.ComparisonType_UNKNOWN_COMPARISON_TYPE,
+								Property: "hello",
+								Operator: flipt.OpEQ,
+								Value:    "world",
+							},
+						},
+					},
+				}),
+			},
+		},
+	}, nil)
+
+	res, err := s.Boolean(t.Context(), &rpcevaluation.EvaluationRequest{
+		FlagKey:      flagKey,
+		EntityId:     "test-entity",
+		NamespaceKey: namespaceKey,
+		Context: map[string]string{
+			"hello": "world",
+		},
+	})
+
+	require.Nil(t, res)
+	require.EqualError(t, err, "unknown constraint type")
+
+	data := collectMetrics(t)
+	assert.Equal(t, int64(1), metricCounterValueDelta(t, "flipt_evaluations_errors", &baseline, &data))
+	assert.Equal(t, int64(0), metricCounterValueDelta(t, "flipt_evaluations_results", &baseline, &data))
+}
+
+func TestBatch_UnknownFlagType(t *testing.T) {
+	var (
+		flagKey      = "test-flag"
+		namespaceKey = "test-namespace"
+		envStore     = NewMockEnvironmentStore(t)
+		environment  = environments.NewMockEnvironment(t)
+		store        = storage.NewMockReadOnlyStore(t)
+		logger       = zaptest.NewLogger(t)
+		s            = New(logger, envStore, WithMetrics(true))
+	)
+
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+	environment.EXPECT().Key().Return(t.Name())
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:         flagKey,
+		Enabled:     true,
+		Description: "test-flag",
+		Type:        3,
+	}, nil)
+
+	resp, err := s.Batch(t.Context(), &rpcevaluation.BatchEvaluationRequest{
+		Requests: []*rpcevaluation.EvaluationRequest{
+			{
+				FlagKey:      flagKey,
+				EntityId:     "test-entity",
+				NamespaceKey: namespaceKey,
+				Context: map[string]string{
+					"hello": "world",
+				},
+			},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, resp.GetResponses(), 1)
+	er := resp.GetResponses()[0].GetErrorResponse()
+	assert.NotNil(t, er)
+	assert.Equal(t, rpcevaluation.ErrorEvaluationReason_UNKNOWN_ERROR_EVALUATION_REASON, er.GetReason())
+}
+
+func TestBatch_InternalError_GetFlag(t *testing.T) {
+	var (
+		flagKey      = "test-flag"
+		namespaceKey = "test-namespace"
+		envStore     = NewMockEnvironmentStore(t)
+		environment  = environments.NewMockEnvironment(t)
+		store        = storage.NewMockReadOnlyStore(t)
+		logger       = zaptest.NewLogger(t)
+		s            = New(logger, envStore, WithMetrics(true))
+	)
+
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+	environment.EXPECT().Key().Return(t.Name())
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{}, errors.New("internal error"))
+
+	resp, err := s.Batch(t.Context(), &rpcevaluation.BatchEvaluationRequest{
+		Requests: []*rpcevaluation.EvaluationRequest{
+			{
+				FlagKey:      flagKey,
+				EntityId:     "test-entity",
+				NamespaceKey: namespaceKey,
+				Context: map[string]string{
+					"hello": "world",
+				},
+			},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, resp.GetResponses(), 1)
+	er := resp.GetResponses()[0].GetErrorResponse()
+	assert.NotNil(t, er)
+	assert.Equal(t, rpcevaluation.ErrorEvaluationReason_UNKNOWN_ERROR_EVALUATION_REASON, er.GetReason())
+}
+
+func TestBatch_NotFoundError_GetFlag(t *testing.T) {
+	var (
+		flagKey      = "test-flag"
+		namespaceKey = "test-namespace"
+		envStore     = NewMockEnvironmentStore(t)
+		environment  = environments.NewMockEnvironment(t)
+		store        = storage.NewMockReadOnlyStore(t)
+		logger       = zaptest.NewLogger(t)
+		s            = New(logger, envStore, WithMetrics(true))
+	)
+
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{}, errs.ErrNotFound("unknown flag"))
+
+	resp, err := s.Batch(t.Context(), &rpcevaluation.BatchEvaluationRequest{
+		Requests: []*rpcevaluation.EvaluationRequest{
+			{
+				FlagKey:      flagKey,
+				EntityId:     "test-entity",
+				NamespaceKey: namespaceKey,
+				Context: map[string]string{
+					"hello": "world",
+				},
+			},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, resp.GetResponses(), 1)
+	er := resp.GetResponses()[0].GetErrorResponse()
+	assert.NotNil(t, er)
+	assert.Equal(t, rpcevaluation.ErrorEvaluationReason_NOT_FOUND_ERROR_EVALUATION_REASON, er.GetReason())
+}
+
+func TestBatch_EvaluationError(t *testing.T) {
+	var (
+		booleanFlagKey = "boolean-test-flag"
+		variantFlagKey = "variant-test-flag"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+	environment.EXPECT().Key().Return(t.Name())
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, booleanFlagKey)).Return(&core.Flag{
+		Key:     booleanFlagKey,
+		Enabled: true,
+		Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, variantFlagKey)).Return(&core.Flag{
+		Key:     variantFlagKey,
+		Enabled: true,
+		Type:    core.FlagType_VARIANT_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, booleanFlagKey)).Return([]*storage.EvaluationRollout{
+		{
+			NamespaceKey: namespaceKey,
+			Rank:         1,
+			RolloutType:  core.RolloutType_SEGMENT_ROLLOUT_TYPE,
+			Segment: &storage.RolloutSegment{
+				Value:           true,
+				SegmentOperator: core.SegmentOperator_OR_SEGMENT_OPERATOR,
+				Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+					"test-segment": {
+						SegmentKey: "test-segment",
+						MatchType:  core.MatchType_ANY_MATCH_TYPE,
+						Constraints: []storage.EvaluationConstraint{
+							{
+								Type:     core.ComparisonType_UNKNOWN_COMPARISON_TYPE,
+								Property: "hello",
+								Operator: flipt.OpEQ,
+								Value:    "world",
+							},
+						},
+					},
+				}),
+			},
+		},
+	}, nil)
+
+	store.On("GetEvaluationRules", mock.Anything, storage.NewResource(namespaceKey, variantFlagKey)).Return([]*storage.EvaluationRule{}, errors.New("variant evaluation error"))
+
+	resp, err := s.Batch(t.Context(), &rpcevaluation.BatchEvaluationRequest{
+		Requests: []*rpcevaluation.EvaluationRequest{
+			{
+				FlagKey:      booleanFlagKey,
+				EntityId:     "test-entity",
+				NamespaceKey: namespaceKey,
+				Context: map[string]string{
+					"hello": "world",
+				},
+			},
+			{
+				FlagKey:      variantFlagKey,
+				EntityId:     "test-entity",
+				NamespaceKey: namespaceKey,
+				Context: map[string]string{
+					"hello": "world",
+				},
+			},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, resp.GetResponses(), 2)
+
+	b, ok := resp.GetResponses()[0].GetResponse().(*rpcevaluation.EvaluationResponse_ErrorResponse)
+	require.True(t, ok, "response should be a error evaluation response")
+	assert.Equal(t, booleanFlagKey, b.ErrorResponse.GetFlagKey())
+	assert.Equal(t, namespaceKey, b.ErrorResponse.GetNamespaceKey())
+	assert.Equal(t, rpcevaluation.ErrorEvaluationReason_UNKNOWN_ERROR_EVALUATION_REASON, b.ErrorResponse.GetReason())
+
+	v, ok := resp.GetResponses()[1].GetResponse().(*rpcevaluation.EvaluationResponse_ErrorResponse)
+	require.True(t, ok, "response should be a error evaluation response")
+	assert.Equal(t, variantFlagKey, v.ErrorResponse.GetFlagKey())
+	assert.Equal(t, namespaceKey, v.ErrorResponse.GetNamespaceKey())
+	assert.Equal(t, rpcevaluation.ErrorEvaluationReason_UNKNOWN_ERROR_EVALUATION_REASON, v.ErrorResponse.GetReason())
+}
+
+func TestBatch_Success(t *testing.T) {
+	var (
+		flagKey        = "test-flag"
+		environmentKey = "test-environment"
+		anotherFlagKey = "another-test-flag"
+		variantFlagKey = "variant-test-flag"
+		namespaceKey   = "test-namespace"
+		envStore       = NewMockEnvironmentStore(t)
+		environment    = environments.NewMockEnvironment(t)
+		store          = storage.NewMockReadOnlyStore(t)
+		logger         = zaptest.NewLogger(t)
+		s              = New(logger, envStore, WithMetrics(true))
+	)
+
+	environment.On("Key").Return(environmentKey)
+	envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+	environment.On("EvaluationStore").Return(store, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+		Key:     flagKey,
+		Enabled: true,
+		Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, anotherFlagKey)).Return(&core.Flag{}, errs.ErrNotFound("another-test-flag"))
+
+	store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, variantFlagKey)).Return(&core.Flag{
+		Key:     variantFlagKey,
+		Enabled: true,
+		Type:    core.FlagType_VARIANT_FLAG_TYPE,
+	}, nil)
+
+	store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRollout{
+		{
+			NamespaceKey: namespaceKey,
+			Rank:         1,
+			RolloutType:  core.RolloutType_THRESHOLD_ROLLOUT_TYPE,
+			Threshold: &storage.RolloutThreshold{
+				Percentage: 80,
+				Value:      true,
+			},
+		},
+	}, nil)
+
+	store.On("GetEvaluationRules", mock.Anything, storage.NewResource(namespaceKey, variantFlagKey)).Return(
+		[]*storage.EvaluationRule{
+			{
+				ID:      "1",
+				FlagKey: variantFlagKey,
+				Rank:    0,
+				Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+					"bar": {
+						SegmentKey: "bar",
+						MatchType:  core.MatchType_ALL_MATCH_TYPE,
+						Constraints: []storage.EvaluationConstraint{
+							{
+								ID:       "2",
+								Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+								Property: "hello",
+								Operator: flipt.OpEQ,
+								Value:    "world",
+							},
+						},
+					},
+				}),
+			},
+		}, nil,
+	)
+
+	store.On(
+		"GetEvaluationDistributions",
+		mock.Anything,
+		storage.NewResource(namespaceKey, variantFlagKey),
+		storage.NewID("1"),
+	).Return([]*storage.EvaluationDistribution{}, nil)
+
+	res, err := s.Batch(t.Context(), &rpcevaluation.BatchEvaluationRequest{
+		Requests: []*rpcevaluation.EvaluationRequest{
+			{
+				RequestId:    "1",
+				FlagKey:      flagKey,
+				EntityId:     "test-entity",
+				NamespaceKey: namespaceKey,
+				Context: map[string]string{
+					"hello": "world",
+				},
+			},
+			{
+				RequestId:    "2",
+				FlagKey:      anotherFlagKey,
+				EntityId:     "test-entity",
+				NamespaceKey: namespaceKey,
+				Context: map[string]string{
+					"hello": "world",
+				},
+			},
+			{
+				RequestId:    "3",
+				FlagKey:      variantFlagKey,
+				EntityId:     "test-entity",
+				NamespaceKey: namespaceKey,
+				Context: map[string]string{
+					"hello": "world",
+				},
+			},
+		},
+	})
+
+	require.NoError(t, err)
+	assert.Len(t, res.Responses, 3)
+
+	b, ok := res.Responses[0].Response.(*rpcevaluation.EvaluationResponse_BooleanResponse)
+	assert.True(t, ok, "response should be a boolean evaluation response")
+	assert.True(t, b.BooleanResponse.Enabled, "value should be true from match")
+	assert.Equal(t, rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON, b.BooleanResponse.Reason)
+	assert.Equal(t, rpcevaluation.EvaluationResponseType_BOOLEAN_EVALUATION_RESPONSE_TYPE, res.Responses[0].Type)
+	assert.Equal(t, "1", b.BooleanResponse.RequestId)
+	assert.Equal(t, flagKey, b.BooleanResponse.FlagKey)
+
+	e, ok := res.Responses[1].Response.(*rpcevaluation.EvaluationResponse_ErrorResponse)
+	assert.True(t, ok, "response should be a error evaluation response")
+	assert.Equal(t, anotherFlagKey, e.ErrorResponse.FlagKey)
+	assert.Equal(t, namespaceKey, e.ErrorResponse.NamespaceKey)
+	assert.Equal(t, rpcevaluation.ErrorEvaluationReason_NOT_FOUND_ERROR_EVALUATION_REASON, e.ErrorResponse.Reason)
+	assert.Equal(t, rpcevaluation.EvaluationResponseType_ERROR_EVALUATION_RESPONSE_TYPE, res.Responses[1].Type)
+
+	v, ok := res.Responses[2].Response.(*rpcevaluation.EvaluationResponse_VariantResponse)
+	assert.True(t, ok, "response should be a variant evaluation response")
+	assert.True(t, v.VariantResponse.Match, "variant response should have matched")
+	assert.Contains(t, v.VariantResponse.SegmentKeys, "bar")
+	assert.Equal(t, rpcevaluation.EvaluationReason_MATCH_EVALUATION_REASON, v.VariantResponse.Reason)
+	assert.Equal(t, rpcevaluation.EvaluationResponseType_VARIANT_EVALUATION_RESPONSE_TYPE, res.Responses[2].Type)
+	assert.Equal(t, "3", v.VariantResponse.RequestId)
+	assert.Equal(t, variantFlagKey, v.VariantResponse.FlagKey)
+}
+
+func Test_matchesString(t *testing.T) {
+	tests := []struct {
+		name       string
+		constraint storage.EvaluationConstraint
+		value      string
+		wantMatch  bool
+	}{
+		{
+			name: "eq",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Value:    "bar",
+			},
+			value:     "bar",
+			wantMatch: true,
+		},
+		{
+			name: "negative eq",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Value:    "bar",
+			},
+			value: "baz",
+		},
+		{
+			name: "neq",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "neq",
+				Value:    "bar",
+			},
+			value:     "baz",
+			wantMatch: true,
+		},
+		{
+			name: "negative neq",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "neq",
+				Value:    "bar",
+			},
+			value: "bar",
+		},
+		{
+			name: "empty",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "empty",
+			},
+			value:     " ",
+			wantMatch: true,
+		},
+		{
+			name: "negative empty",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "empty",
+			},
+			value: "bar",
+		},
+		{
+			name: "not empty",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "notempty",
+			},
+			value:     "bar",
+			wantMatch: true,
+		},
+		{
+			name: "negative not empty",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "notempty",
+			},
+			value: "",
+		},
+		{
+			name: "unknown operator",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "foo",
+				Value:    "bar",
+			},
+			value: "bar",
+		},
+		{
+			name: "prefix",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "prefix",
+				Value:    "ba",
+			},
+			value:     "bar",
+			wantMatch: true,
+		},
+		{
+			name: "negative prefix",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "prefix",
+				Value:    "bar",
+			},
+			value: "nope",
+		},
+		{
+			name: "suffix",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "suffix",
+				Value:    "ar",
+			},
+			value:     "bar",
+			wantMatch: true,
+		},
+		{
+			name: "negative suffix",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "suffix",
+				Value:    "bar",
+			},
+			value: "nope",
+		},
+		{
+			name: "is one of",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "isoneof",
+				Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+				Value:    "[\"bar\", \"baz\"]",
+			},
+			value:     "baz",
+			wantMatch: true,
+		},
+		{
+			name: "negative is one of",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "isoneof",
+				Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+				Value:    "[\"bar\", \"baz\"]",
+			},
+			value: "nope",
+		},
+		{
+			name: "is not one of",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "isnotoneof",
+				Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+				Value:    "[\"bar\", \"baz\"]",
+			},
+			value: "baz",
+		},
+		{
+			name: "negative is not one of",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "isnotoneof",
+				Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+				Value:    "[\"bar\", \"baz\"]",
+			},
+			value:     "nope",
+			wantMatch: true,
+		},
+		{
+			name: "contains",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "contains",
+				Value:    "bar",
+			},
+			value:     "foobar",
+			wantMatch: true,
+		},
+		{
+			name: "negative contains",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "contains",
+				Value:    "bar",
+			},
+			value: "nope",
+		},
+		{
+			name: "not contains",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "notcontains",
+				Value:    "bar",
+			},
+			value:     "nope",
+			wantMatch: true,
+		},
+		{
+			name: "negative not contains",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "notcontains",
+				Value:    "bar",
+			},
+			value: "foobar",
+		},
+	}
+	for _, tt := range tests {
+		var (
+			constraint = tt.constraint
+			value      = tt.value
+			wantMatch  = tt.wantMatch
+		)
+
+		require.NoError(t, constraint.PrepareForEvaluation())
+
+		t.Run(tt.name, func(t *testing.T) {
+			match, err := matchesString(constraint, value)
+			require.NoError(t, err)
+			assert.Equal(t, wantMatch, match)
+		})
+	}
+}
+
+func Test_matchesNumber(t *testing.T) {
+	tests := []struct {
+		name       string
+		constraint storage.EvaluationConstraint
+		value      string
+		wantMatch  bool
+		wantErr    bool
+	}{
+		{
+			name: "present",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "present",
+			},
+			value:     "1",
+			wantMatch: true,
+		},
+		{
+			name: "negative present",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "present",
+			},
+		},
+		{
+			name: "not present",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "notpresent",
+			},
+			wantMatch: true,
+		},
+		{
+			name: "negative notpresent",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "notpresent",
+			},
+			value: "1",
+		},
+		{
+			name: "NAN context value",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "5",
+			},
+			value:   "foo",
+			wantErr: true,
+		},
+		{
+			name: "eq",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "42.0",
+			},
+			value:     "42.0",
+			wantMatch: true,
+		},
+		{
+			name: "negative eq",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "42.0",
+			},
+			value: "50",
+		},
+		{
+			name: "neq",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "neq",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "42.0",
+			},
+			value:     "50",
+			wantMatch: true,
+		},
+		{
+			name: "negative neq",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "neq",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "42.0",
+			},
+			value: "42.0",
+		},
+		{
+			name: "lt",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "lt",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "42.0",
+			},
+			value:     "8",
+			wantMatch: true,
+		},
+		{
+			name: "negative lt",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "lt",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "42.0",
+			},
+			value: "50",
+		},
+		{
+			name: "lte",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "lte",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "42.0",
+			},
+			value:     "42.0",
+			wantMatch: true,
+		},
+		{
+			name: "negative lte",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "lte",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "42.0",
+			},
+			value: "102.0",
+		},
+		{
+			name: "gt",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "gt",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "10.11",
+			},
+			value:     "10.12",
+			wantMatch: true,
+		},
+		{
+			name: "negative gt",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "gt",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "10.11",
+			},
+			value: "1",
+		},
+		{
+			name: "gte",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "gte",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "10.11",
+			},
+			value:     "10.11",
+			wantMatch: true,
+		},
+		{
+			name: "negative gte",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "gte",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "10.11",
+			},
+			value: "0.11",
+		},
+		{
+			name: "empty value",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "0.11",
+			},
+		},
+		{
+			name: "unknown operator",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "foo",
+				Value:    "0.11",
+			},
+			value: "0.11",
+		},
+		{
+			name: "negative suffix empty value",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "suffix",
+				Value:    "bar",
+			},
+		},
+		{
+			name: "is one of",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "isoneof",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "[3, 3.14159, 4]",
+			},
+			value:     "3.14159",
+			wantMatch: true,
+		},
+		{
+			name: "negative is one of",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "isoneof",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "[5, 3.14159, 4]",
+			},
+			value: "9",
+		},
+		{
+			name: "is not one of",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "isnotoneof",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "[5, 3.14159, 4]",
+			},
+			value:     "3",
+			wantMatch: true,
+		},
+		{
+			name: "negative is not one of",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "isnotoneof",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "[5, 3.14159, 4]",
+			},
+			value:     "3.14159",
+			wantMatch: false,
+		},
+		{
+			name: "empty constraint value with eq does not match zero",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+			},
+			value:   "0",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		var (
+			constraint = tt.constraint
+			value      = tt.value
+			wantMatch  = tt.wantMatch
+			wantErr    = tt.wantErr
+		)
+
+		require.NoError(t, constraint.PrepareForEvaluation())
+
+		t.Run(tt.name, func(t *testing.T) {
+			match, err := matchesNumber(constraint, value)
+
+			if wantErr {
+				require.Error(t, err)
+				var ierr errs.ErrInvalid
+				assert.ErrorAs(t, err, &ierr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, wantMatch, match)
+		})
+	}
+}
+
+func Test_matchesStringWithPreparedSets(t *testing.T) {
+	tests := []struct {
+		name       string
+		constraint storage.EvaluationConstraint
+		value      string
+		wantMatch  bool
+	}{
+		{
+			name: "is one of (prepared)",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "isoneof",
+				Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+				Value:    `["bar", "baz"]`,
+			},
+			value:     "baz",
+			wantMatch: true,
+		},
+		{
+			name: "negative is one of (prepared)",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "isoneof",
+				Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+				Value:    `["bar", "baz"]`,
+			},
+			value: "nope",
+		},
+		{
+			name: "is not one of (prepared)",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "isnotoneof",
+				Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+				Value:    `["bar", "baz"]`,
+			},
+			value: "baz",
+		},
+		{
+			name: "negative is not one of (prepared)",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "isnotoneof",
+				Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+				Value:    `["bar", "baz"]`,
+			},
+			value:     "nope",
+			wantMatch: true,
+		},
+		{
+			name: "is one of many values (prepared)",
+			constraint: storage.EvaluationConstraint{
+				Property: "tenant",
+				Operator: "isoneof",
+				Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+				Value:    `["tenant-0","tenant-1","tenant-2","tenant-3","tenant-4","tenant-5","tenant-6","tenant-7","tenant-8","tenant-9"]`,
+			},
+			value:     "tenant-7",
+			wantMatch: true,
+		},
+		{
+			name: "is not in many values (prepared)",
+			constraint: storage.EvaluationConstraint{
+				Property: "tenant",
+				Operator: "isoneof",
+				Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+				Value:    `["tenant-0","tenant-1","tenant-2","tenant-3","tenant-4","tenant-5","tenant-6","tenant-7","tenant-8","tenant-9"]`,
+			},
+			value: "tenant-99",
+		},
+	}
+	for _, tt := range tests {
+		constraint := tt.constraint
+		if constraint.StringSet == nil {
+			require.NoError(t, constraint.PrepareForEvaluation())
+		}
+
+		t.Run(tt.name, func(t *testing.T) {
+			require.NotNil(t, constraint.StringSet, "StringSet should be populated after PrepareForEvaluation")
+			match, err := matchesString(constraint, tt.value)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantMatch, match)
+		})
+	}
+}
+
+func TestPrepareForEvaluation_Errors(t *testing.T) {
+	tests := []struct {
+		name       string
+		constraint storage.EvaluationConstraint
+		wantErr    string
+	}{
+		{
+			name: "invalid JSON for string set",
+			constraint: storage.EvaluationConstraint{
+				Property: "tenant",
+				Operator: "isoneof",
+				Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+				Value:    `["bar", "baz"`,
+			},
+			wantErr: `constraint "tenant": parsing string set`,
+		},
+		{
+			name: "non-string values in string set",
+			constraint: storage.EvaluationConstraint{
+				Property: "tenant",
+				Operator: "isnotoneof",
+				Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+				Value:    `[1, 2, 3]`,
+			},
+			wantErr: `constraint "tenant": parsing string set`,
+		},
+		{
+			name: "invalid JSON for number set",
+			constraint: storage.EvaluationConstraint{
+				Property: "age",
+				Operator: "isoneof",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    `not json`,
+			},
+			wantErr: `constraint "age": parsing number set`,
+		},
+		{
+			name: "non-number values in number set",
+			constraint: storage.EvaluationConstraint{
+				Property: "age",
+				Operator: "isnotoneof",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    `["a", "b"]`,
+			},
+			wantErr: `constraint "age": parsing number set`,
+		},
+		{
+			name: "invalid number for scalar operator",
+			constraint: storage.EvaluationConstraint{
+				Property: "age",
+				Operator: "gte",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "not a number",
+			},
+			wantErr: `constraint "age": parsing number`,
+		},
+		{
+			name: "no error for string eq with arbitrary value",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+				Value:    `not json`,
+			},
+		},
+		{
+			name: "no error for valid number scalar",
+			constraint: storage.EvaluationConstraint{
+				Property: "age",
+				Operator: "lt",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    "42.5",
+			},
+		},
+		{
+			name: "invalid datetime",
+			constraint: storage.EvaluationConstraint{
+				Property: "created_at",
+				Operator: "gte",
+				Type:     core.ComparisonType_DATETIME_COMPARISON_TYPE,
+				Value:    "not a date",
+			},
+			wantErr: `constraint "created_at": parsing datetime from "not a date"`,
+		},
+		{
+			name: "no error for valid RFC3339 datetime",
+			constraint: storage.EvaluationConstraint{
+				Property: "created_at",
+				Operator: "gte",
+				Type:     core.ComparisonType_DATETIME_COMPARISON_TYPE,
+				Value:    "2024-01-15T10:30:00Z",
+			},
+		},
+		{
+			name: "no error for valid DateOnly datetime",
+			constraint: storage.EvaluationConstraint{
+				Property: "created_at",
+				Operator: "eq",
+				Type:     core.ComparisonType_DATETIME_COMPARISON_TYPE,
+				Value:    "2024-01-15",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.constraint.PrepareForEvaluation()
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func Test_matchesString_ErrorsWithoutPrepare(t *testing.T) {
+	c := storage.EvaluationConstraint{
+		Property: "tenant",
+		Operator: "isoneof",
+		Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+		Value:    `["a","b"]`,
+	}
+	match, err := matchesString(c, "a")
+	require.Error(t, err)
+	var ierr errs.ErrInvalid
+	require.ErrorAs(t, err, &ierr)
+	assert.False(t, match)
+}
+
+func Test_matchesNumber_ErrorsWithoutPrepare(t *testing.T) {
+	t.Run("is not one of", func(t *testing.T) {
+		c := storage.EvaluationConstraint{
+			Property: "count",
+			Operator: "isnotoneof",
+			Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+			Value:    `[1,2,3]`,
+		}
+		match, err := matchesNumber(c, "1")
+		require.Error(t, err)
+		var ierr errs.ErrInvalid
+		require.ErrorAs(t, err, &ierr)
+		assert.False(t, match)
+	})
+
+	t.Run("scalar eq", func(t *testing.T) {
+		c := storage.EvaluationConstraint{
+			Property: "count",
+			Operator: "eq",
+			Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+			Value:    "5",
+		}
+		match, err := matchesNumber(c, "1")
+		require.Error(t, err)
+		var ierr errs.ErrInvalid
+		require.ErrorAs(t, err, &ierr)
+		assert.False(t, match)
+	})
+
+	t.Run("scalar lt", func(t *testing.T) {
+		c := storage.EvaluationConstraint{
+			Property: "count",
+			Operator: "lt",
+			Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+			Value:    "5",
+		}
+		match, err := matchesNumber(c, "1")
+		require.Error(t, err)
+		var ierr errs.ErrInvalid
+		require.ErrorAs(t, err, &ierr)
+		assert.False(t, match)
+	})
+}
+
+func Test_matchesNumberWithPreparedSets(t *testing.T) {
+	tests := []struct {
+		name       string
+		constraint storage.EvaluationConstraint
+		value      string
+		wantMatch  bool
+	}{
+		{
+			name: "is one of (prepared)",
+			constraint: storage.EvaluationConstraint{
+				Property: "age",
+				Operator: "isoneof",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    `[1, 2, 3]`,
+			},
+			value:     "2",
+			wantMatch: true,
+		},
+		{
+			name: "negative is one of (prepared)",
+			constraint: storage.EvaluationConstraint{
+				Property: "age",
+				Operator: "isoneof",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    `[1, 2, 3]`,
+			},
+			value: "4",
+		},
+		{
+			name: "is not one of (prepared)",
+			constraint: storage.EvaluationConstraint{
+				Property: "age",
+				Operator: "isnotoneof",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    `[1, 2, 3]`,
+			},
+			value: "2",
+		},
+		{
+			name: "negative is not one of (prepared)",
+			constraint: storage.EvaluationConstraint{
+				Property: "age",
+				Operator: "isnotoneof",
+				Type:     core.ComparisonType_NUMBER_COMPARISON_TYPE,
+				Value:    `[1, 2, 3]`,
+			},
+			value:     "4",
+			wantMatch: true,
+		},
+	}
+	for _, tt := range tests {
+		constraint := tt.constraint
+		require.NoError(t, constraint.PrepareForEvaluation())
+
+		t.Run(tt.name, func(t *testing.T) {
+			require.NotNil(t, constraint.NumberSet, "NumberSet should be populated after PrepareForEvaluation")
+			match, err := matchesNumber(constraint, tt.value)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantMatch, match)
+		})
+	}
+}
+
+func Test_matchesBool(t *testing.T) {
+	tests := []struct {
+		name       string
+		constraint storage.EvaluationConstraint
+		value      string
+		wantMatch  bool
+		wantErr    bool
+	}{
+		{
+			name: "present",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "present",
+			},
+			value:     "true",
+			wantMatch: true,
+		},
+		{
+			name: "negative present",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "present",
+			},
+		},
+		{
+			name: "not present",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "notpresent",
+			},
+			wantMatch: true,
+		},
+		{
+			name: "negative notpresent",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "notpresent",
+			},
+			value: "true",
+		},
+		{
+			name: "not a bool",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "true",
+			},
+			value:   "foo",
+			wantErr: true,
+		},
+		{
+			name: "is true",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "true",
+			},
+			value:     "true",
+			wantMatch: true,
+		},
+		{
+			name: "negative is true",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "true",
+			},
+			value: "false",
+		},
+		{
+			name: "is false",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "false",
+			},
+			value:     "false",
+			wantMatch: true,
+		},
+		{
+			name: "negative is false",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "false",
+			},
+			value: "true",
+		},
+		{
+			name: "empty value",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "false",
+			},
+		},
+		{
+			name: "unknown operator",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "foo",
+			},
+			value: "true",
+		},
+	}
+
+	for _, tt := range tests {
+		var (
+			constraint = tt.constraint
+			value      = tt.value
+			wantMatch  = tt.wantMatch
+			wantErr    = tt.wantErr
+		)
+
+		t.Run(tt.name, func(t *testing.T) {
+			match, err := matchesBool(constraint, value)
+
+			if wantErr {
+				require.Error(t, err)
+				var ierr errs.ErrInvalid
+				assert.ErrorAs(t, err, &ierr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, wantMatch, match)
+		})
+	}
+}
+
+func Test_matchesDateTime(t *testing.T) {
+	tests := []struct {
+		name       string
+		constraint storage.EvaluationConstraint
+		value      string
+		wantMatch  bool
+		wantErr    bool
+	}{
+		{
+			name: "present",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "present",
+			},
+			value:     "2006-01-02T15:04:05Z",
+			wantMatch: true,
+		},
+		{
+			name: "negative present",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "present",
+			},
+		},
+		{
+			name: "not present",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "notpresent",
+			},
+			wantMatch: true,
+		},
+		{
+			name: "negative notpresent",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "notpresent",
+			},
+			value: "2006-01-02T15:04:05Z",
+		},
+		{
+			name: "not a datetime constraint value",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Value:    "bar",
+			},
+			value:   "2006-01-02T15:04:05Z",
+			wantErr: true,
+		},
+		{
+			name: "not a datetime context value",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Value:    "2006-01-02T15:04:05Z",
+			},
+			value:   "foo",
+			wantErr: true,
+		},
+		{
+			name: "eq",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Value:    "2006-01-02T15:04:05Z",
+			},
+			value:     "2006-01-02T15:04:05Z",
+			wantMatch: true,
+		},
+		{
+			name: "eq date only",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Value:    "2006-01-02",
+			},
+			value:     "2006-01-02",
+			wantMatch: true,
+		},
+		{
+			name: "negative eq",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Value:    "2006-01-02T15:04:05Z",
+			},
+			value: "2007-01-02T15:04:05Z",
+		},
+		{
+			name: "neq",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "neq",
+				Value:    "2006-01-02T15:04:05Z",
+			},
+			value:     "2007-01-02T15:04:05Z",
+			wantMatch: true,
+		},
+		{
+			name: "negative neq",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "neq",
+				Value:    "2006-01-02T15:04:05Z",
+			},
+			value: "2006-01-02T15:04:05Z",
+		},
+		{
+			name: "negative neq date only",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "neq",
+				Value:    "2006-01-02",
+			},
+			value: "2006-01-02",
+		},
+		{
+			name: "lt",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "lt",
+				Value:    "2006-01-02T15:04:05Z",
+			},
+			value:     "2005-01-02T15:04:05Z",
+			wantMatch: true,
+		},
+		{
+			name: "negative lt",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "lt",
+				Value:    "2005-01-02T15:04:05Z",
+			},
+			value: "2006-01-02T15:04:05Z",
+		},
+		{
+			name: "lte",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "lte",
+				Value:    "2006-01-02T15:04:05Z",
+			},
+			value:     "2006-01-02T15:04:05Z",
+			wantMatch: true,
+		},
+		{
+			name: "negative lte",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "lte",
+				Value:    "2006-01-02T15:04:05Z",
+			},
+			value: "2007-01-02T15:04:05Z",
+		},
+		{
+			name: "gt",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "gt",
+				Value:    "2006-01-02T15:04:05Z",
+			},
+			value:     "2007-01-02T15:04:05Z",
+			wantMatch: true,
+		},
+		{
+			name: "negative gt",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "gt",
+				Value:    "2007-01-02T15:04:05Z",
+			},
+			value: "2006-01-02T15:04:05Z",
+		},
+		{
+			name: "gte",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "gte",
+				Value:    "2006-01-02T15:04:05Z",
+			},
+			value:     "2006-01-02T15:04:05Z",
+			wantMatch: true,
+		},
+		{
+			name: "negative gte",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "gte",
+				Value:    "2006-01-02T15:04:05Z",
+			},
+			value: "2005-01-02T15:04:05Z",
+		},
+		{
+			name: "empty value",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "eq",
+				Value:    "2006-01-02T15:04:05Z",
+			},
+		},
+		{
+			name: "unknown operator",
+			constraint: storage.EvaluationConstraint{
+				Property: "foo",
+				Operator: "foo",
+				Value:    "2006-01-02T15:04:05Z",
+			},
+			value: "2006-01-02T15:04:05Z",
+		},
+	}
+
+	for _, tt := range tests {
+		var (
+			constraint = tt.constraint
+			value      = tt.value
+			wantMatch  = tt.wantMatch
+			wantErr    = tt.wantErr
+		)
+
+		t.Run(tt.name, func(t *testing.T) {
+			match, err := matchesDateTime(constraint, value)
+
+			if wantErr {
+				require.Error(t, err)
+				var ierr errs.ErrInvalid
+				assert.ErrorAs(t, err, &ierr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, wantMatch, match)
+		})
+	}
+}
+
+func TestEvaluationWithTracing(t *testing.T) {
+	tests := []struct {
+		name               string
+		tracingEnabled     bool
+		expectedEventCount int
+		setupMocks         func(t *testing.T, envStore *MockEnvironmentStore, environment *environments.MockEnvironment, store *storage.MockReadOnlyStore, namespaceKey string)
+		runEvaluation      func(ctx context.Context, s *Server) error
+		validateEvents     func(t *testing.T, events []sdktrace.Event, environmentKey, namespaceKey string)
+	}{
+		{
+			name:               "variant_flag_with_tracing",
+			tracingEnabled:     true,
+			expectedEventCount: 1,
+			setupMocks: func(t *testing.T, envStore *MockEnvironmentStore, environment *environments.MockEnvironment, store *storage.MockReadOnlyStore, namespaceKey string) {
+				flagKey := "test-flag"
+				environment.On("Key").Return("test-environment")
+				envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+				environment.On("EvaluationStore").Return(store, nil)
+
+				store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+					Key:     flagKey,
+					Enabled: true,
+					Type:    core.FlagType_VARIANT_FLAG_TYPE,
+				}, nil)
+
+				store.On("GetEvaluationRules", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(
+					[]*storage.EvaluationRule{
+						{
+							ID:      "1",
+							FlagKey: flagKey,
+							Rank:    0,
+							Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+								"segment-1": {
+									SegmentKey: "segment-1",
+									MatchType:  core.MatchType_ALL_MATCH_TYPE,
+									Constraints: []storage.EvaluationConstraint{
+										{
+											ID:       "2",
+											Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+											Property: "hello",
+											Operator: flipt.OpEQ,
+											Value:    "world",
+										},
+									},
+								},
+							}),
+						},
+					}, nil,
+				)
+
+				store.On(
+					"GetEvaluationDistributions",
+					mock.Anything,
+					storage.NewResource(namespaceKey, flagKey),
+					storage.NewID("1"),
+				).Return([]*storage.EvaluationDistribution{
+					{
+						RuleID:     "1",
+						VariantID:  "variant-1",
+						VariantKey: "test-variant",
+						Rollout:    100,
+					},
+				}, nil)
+			},
+			runEvaluation: func(ctx context.Context, s *Server) error {
+				_, err := s.Variant(ctx, &rpcevaluation.EvaluationRequest{
+					FlagKey:        "test-flag",
+					EnvironmentKey: "test-environment",
+					EntityId:       "test-entity",
+					RequestId:      "test-request-id",
+					NamespaceKey:   "test-namespace",
+					Context: map[string]string{
+						"hello": "world",
+					},
+				})
+				return err
+			},
+			validateEvents: func(t *testing.T, events []sdktrace.Event, environmentKey, namespaceKey string) {
+				require.Len(t, events, 1)
+				event := events[0]
+				assert.Equal(t, tracing.Event, event.Name)
+				attrs := event.Attributes
+				assertAttributeValue(t, attrs, tracing.AttributeEnvironment, environmentKey)
+				assertAttributeValue(t, attrs, tracing.AttributeNamespace, namespaceKey)
+				assertAttributeValue(t, attrs, tracing.AttributeFlag, "test-flag")
+				assertAttributeValue(t, attrs, tracing.AttributeEntityID, "test-entity")
+				assertAttributeValue(t, attrs, tracing.AttributeRequestID, "test-request-id")
+				assertAttributeValue(t, attrs, tracing.AttributeMatch, true)
+				assertAttributeValue(t, attrs, tracing.AttributeVariant, "test-variant")
+				assertAttributeValue(t, attrs, tracing.AttributeReason, "match")
+				assertAttributeValue(t, attrs, tracing.AttributeFlagType, "variant")
+			},
+		},
+		{
+			name:               "boolean_flag_with_tracing",
+			tracingEnabled:     true,
+			expectedEventCount: 1,
+			setupMocks: func(t *testing.T, envStore *MockEnvironmentStore, environment *environments.MockEnvironment, store *storage.MockReadOnlyStore, namespaceKey string) {
+				flagKey := "test-flag"
+				environment.On("Key").Return("test-environment")
+				envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+				environment.On("EvaluationStore").Return(store, nil)
+
+				store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+					Key:     flagKey,
+					Enabled: true,
+					Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+				}, nil)
+
+				store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRollout{
+					{
+						NamespaceKey: namespaceKey,
+						Rank:         1,
+						RolloutType:  core.RolloutType_THRESHOLD_ROLLOUT_TYPE,
+						Threshold: &storage.RolloutThreshold{
+							Percentage: 100,
+							Value:      true,
+						},
+					},
+				}, nil)
+			},
+			runEvaluation: func(ctx context.Context, s *Server) error {
+				_, err := s.Boolean(ctx, &rpcevaluation.EvaluationRequest{
+					FlagKey:        "test-flag",
+					EnvironmentKey: "test-environment",
+					EntityId:       "test-entity",
+					RequestId:      "test-request-id",
+					NamespaceKey:   "test-namespace",
+					Context: map[string]string{
+						"hello": "world",
+					},
+				})
+				return err
+			},
+			validateEvents: func(t *testing.T, events []sdktrace.Event, environmentKey, namespaceKey string) {
+				require.Len(t, events, 1)
+				event := events[0]
+				assert.Equal(t, tracing.Event, event.Name)
+				attrs := event.Attributes
+				assertAttributeValue(t, attrs, tracing.AttributeEnvironment, environmentKey)
+				assertAttributeValue(t, attrs, tracing.AttributeNamespace, namespaceKey)
+				assertAttributeValue(t, attrs, tracing.AttributeFlag, "test-flag")
+				assertAttributeValue(t, attrs, tracing.AttributeEntityID, "test-entity")
+				assertAttributeValue(t, attrs, tracing.AttributeRequestID, "test-request-id")
+				assertAttributeValue(t, attrs, tracing.AttributeMatch, true)
+				assertAttributeValue(t, attrs, tracing.AttributeVariant, true)
+				assertAttributeValue(t, attrs, tracing.AttributeReason, "match")
+				assertAttributeValue(t, attrs, tracing.AttributeFlagType, "boolean")
+			},
+		},
+		{
+			name:               "batch_evaluation_with_tracing",
+			tracingEnabled:     true,
+			expectedEventCount: 2,
+			setupMocks: func(t *testing.T, envStore *MockEnvironmentStore, environment *environments.MockEnvironment, store *storage.MockReadOnlyStore, namespaceKey string) {
+				booleanFlagKey := "boolean-flag"
+				variantFlagKey := "variant-flag"
+
+				environment.On("Key").Return("test-environment")
+				envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+				environment.On("EvaluationStore").Return(store, nil)
+
+				// Setup boolean flag
+				store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, booleanFlagKey)).Return(&core.Flag{
+					Key:     booleanFlagKey,
+					Enabled: true,
+					Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+				}, nil)
+
+				store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, booleanFlagKey)).Return([]*storage.EvaluationRollout{
+					{
+						NamespaceKey: namespaceKey,
+						Rank:         1,
+						RolloutType:  core.RolloutType_THRESHOLD_ROLLOUT_TYPE,
+						Threshold: &storage.RolloutThreshold{
+							Percentage: 100,
+							Value:      true,
+						},
+					},
+				}, nil)
+
+				// Setup variant flag
+				store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, variantFlagKey)).Return(&core.Flag{
+					Key:     variantFlagKey,
+					Enabled: true,
+					Type:    core.FlagType_VARIANT_FLAG_TYPE,
+				}, nil)
+
+				store.On("GetEvaluationRules", mock.Anything, storage.NewResource(namespaceKey, variantFlagKey)).Return(
+					[]*storage.EvaluationRule{
+						{
+							ID:      "1",
+							FlagKey: variantFlagKey,
+							Rank:    0,
+							Segments: prepareSegments(t, map[string]*storage.EvaluationSegment{
+								"segment-1": {
+									SegmentKey: "segment-1",
+									MatchType:  core.MatchType_ALL_MATCH_TYPE,
+									Constraints: []storage.EvaluationConstraint{
+										{
+											ID:       "2",
+											Type:     core.ComparisonType_STRING_COMPARISON_TYPE,
+											Property: "hello",
+											Operator: flipt.OpEQ,
+											Value:    "world",
+										},
+									},
+								},
+							}),
+						},
+					}, nil,
+				)
+
+				store.On(
+					"GetEvaluationDistributions",
+					mock.Anything,
+					storage.NewResource(namespaceKey, variantFlagKey),
+					storage.NewID("1"),
+				).Return([]*storage.EvaluationDistribution{
+					{
+						RuleID:     "1",
+						VariantID:  "variant-1",
+						VariantKey: "test-variant",
+						Rollout:    100,
+					},
+				}, nil)
+			},
+			runEvaluation: func(ctx context.Context, s *Server) error {
+				_, err := s.Batch(ctx, &rpcevaluation.BatchEvaluationRequest{
+					Requests: []*rpcevaluation.EvaluationRequest{
+						{
+							RequestId:      "request-1",
+							FlagKey:        "boolean-flag",
+							EntityId:       "test-entity",
+							NamespaceKey:   "test-namespace",
+							EnvironmentKey: "test-environment",
+							Context: map[string]string{
+								"hello": "world",
+							},
+						},
+						{
+							RequestId:      "request-2",
+							FlagKey:        "variant-flag",
+							EntityId:       "test-entity",
+							NamespaceKey:   "test-namespace",
+							EnvironmentKey: "test-environment",
+							Context: map[string]string{
+								"hello": "world",
+							},
+						},
+					},
+				})
+				return err
+			},
+			validateEvents: func(t *testing.T, events []sdktrace.Event, environmentKey, namespaceKey string) {
+				require.Len(t, events, 2, "expected two events (one per flag)")
+
+				// Verify boolean flag event
+				booleanEvent := events[0]
+				assert.Equal(t, tracing.Event, booleanEvent.Name)
+				booleanAttrs := booleanEvent.Attributes
+				assertAttributeValue(t, booleanAttrs, tracing.AttributeEnvironment, environmentKey)
+				assertAttributeValue(t, booleanAttrs, tracing.AttributeNamespace, namespaceKey)
+				assertAttributeValue(t, booleanAttrs, tracing.AttributeFlag, "boolean-flag")
+				assertAttributeValue(t, booleanAttrs, tracing.AttributeEntityID, "test-entity")
+				assertAttributeValue(t, booleanAttrs, tracing.AttributeRequestID, "request-1")
+				assertAttributeValue(t, booleanAttrs, tracing.AttributeMatch, true)
+				assertAttributeValue(t, booleanAttrs, tracing.AttributeVariant, true)
+				assertAttributeValue(t, booleanAttrs, tracing.AttributeFlagType, "boolean")
+
+				// Verify variant flag event
+				variantEvent := events[1]
+				assert.Equal(t, tracing.Event, variantEvent.Name)
+				variantAttrs := variantEvent.Attributes
+				assertAttributeValue(t, variantAttrs, tracing.AttributeEnvironment, environmentKey)
+				assertAttributeValue(t, variantAttrs, tracing.AttributeNamespace, namespaceKey)
+				assertAttributeValue(t, variantAttrs, tracing.AttributeFlag, "variant-flag")
+				assertAttributeValue(t, variantAttrs, tracing.AttributeEntityID, "test-entity")
+				assertAttributeValue(t, variantAttrs, tracing.AttributeRequestID, "request-2")
+				assertAttributeValue(t, variantAttrs, tracing.AttributeMatch, true)
+				assertAttributeValue(t, variantAttrs, tracing.AttributeVariant, "test-variant")
+				assertAttributeValue(t, variantAttrs, tracing.AttributeFlagType, "variant")
+			},
+		},
+		{
+			name:               "tracing_disabled",
+			tracingEnabled:     false,
+			expectedEventCount: 0,
+			setupMocks: func(t *testing.T, envStore *MockEnvironmentStore, environment *environments.MockEnvironment, store *storage.MockReadOnlyStore, namespaceKey string) {
+				flagKey := "test-flag"
+				environment.On("Key").Return("test-environment")
+				envStore.On("Get", mock.Anything, mock.Anything).Return(environment, nil)
+				environment.On("EvaluationStore").Return(store, nil)
+
+				store.On("GetFlag", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return(&core.Flag{
+					Key:     flagKey,
+					Enabled: true,
+					Type:    core.FlagType_BOOLEAN_FLAG_TYPE,
+				}, nil)
+
+				store.On("GetEvaluationRollouts", mock.Anything, storage.NewResource(namespaceKey, flagKey)).Return([]*storage.EvaluationRollout{
+					{
+						NamespaceKey: namespaceKey,
+						Rank:         1,
+						RolloutType:  core.RolloutType_THRESHOLD_ROLLOUT_TYPE,
+						Threshold: &storage.RolloutThreshold{
+							Percentage: 100,
+							Value:      true,
+						},
+					},
+				}, nil)
+			},
+			runEvaluation: func(ctx context.Context, s *Server) error {
+				_, err := s.Boolean(ctx, &rpcevaluation.EvaluationRequest{
+					FlagKey:        "test-flag",
+					EnvironmentKey: "test-environment",
+					EntityId:       "test-entity",
+					RequestId:      "test-request-id",
+					NamespaceKey:   "test-namespace",
+					Context: map[string]string{
+						"hello": "world",
+					},
+				})
+				return err
+			},
+			validateEvents: func(t *testing.T, events []sdktrace.Event, environmentKey, namespaceKey string) {
+				assert.Empty(t, events, "expected no events when tracing is disabled")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var (
+				environmentKey = "test-environment"
+				namespaceKey   = "test-namespace"
+				envStore       = NewMockEnvironmentStore(t)
+				environment    = environments.NewMockEnvironment(t)
+				store          = storage.NewMockReadOnlyStore(t)
+				logger         = zaptest.NewLogger(t)
+			)
+
+			spanRecorder := tracetest.NewSpanRecorder()
+			tp := sdktrace.NewTracerProvider(
+				sdktrace.WithSpanProcessor(spanRecorder),
+				sdktrace.WithSampler(sdktrace.AlwaysSample()),
+			)
+			tracer := tp.Tracer("test")
+
+			s := New(logger, envStore, WithMetrics(true), WithTracing(tt.tracingEnabled))
+
+			tt.setupMocks(t, envStore, environment, store, namespaceKey)
+
+			ctx, span := tracer.Start(t.Context(), "test-span")
+			err := tt.runEvaluation(ctx, s)
+			span.End()
+			require.NoError(t, err)
+
+			spans := spanRecorder.Ended()
+			require.Len(t, spans, 1, "expected one span to be recorded")
+
+			events := spans[0].Events()
+			require.Len(t, events, tt.expectedEventCount)
+
+			if tt.expectedEventCount > 0 {
+				tt.validateEvents(t, events, environmentKey, namespaceKey)
+			}
+		})
+	}
+}
+
+// Helper function to assert attribute values
+func assertAttributeValue(t *testing.T, attrs []attribute.KeyValue, key attribute.Key, expectedValue any) {
+	t.Helper()
+	found := false
+	for _, attr := range attrs {
+		if attr.Key == key {
+			found = true
+			switch v := expectedValue.(type) {
+			case string:
+				assert.Equal(t, v, attr.Value.AsString(), "attribute %s value mismatch", key)
+			case bool:
+				assert.Equal(t, v, attr.Value.AsBool(), "attribute %s value mismatch", key)
+			case []string:
+				actualSlice := attr.Value.AsStringSlice()
+				assert.ElementsMatch(t, v, actualSlice, "attribute %s value mismatch", key)
+			default:
+				t.Fatalf("unsupported type for attribute %s: %T", key, v)
+			}
+			break
+		}
+	}
+	assert.True(t, found, "attribute %s not found in event", key)
+}
+
+// Helper function to assert attribute is not present
+func assertAttributeNotPresent(t *testing.T, attrs []attribute.KeyValue, key attribute.Key) {
+	t.Helper()
+	for _, attr := range attrs {
+		if attr.Key == key {
+			assert.Failf(t, "unexpected attribute", "attribute %s should not be present in event", string(key))
+			return
+		}
+	}
+}

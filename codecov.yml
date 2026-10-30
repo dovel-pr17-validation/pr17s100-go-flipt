@@ -1,0 +1,7 @@
+ignore:
+  - "**/*_mock.go"
+  - "build"
+  - "internal/cmd/protoc-*"
+  - "rpc"
+  - "sdk"
+  - "ui"

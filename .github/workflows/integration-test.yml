@@ -1,0 +1,256 @@
+name: Integration Tests
+on:
+  push:
+    branches:
+      - v2
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DAGGER_NO_NAG: "1"
+  REGISTRY_CACHE: ghcr.io/${{ github.repository }}-cache
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.head_ref || github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      go: ${{ steps.changes.outputs.go }}
+      ui: ${{ steps.changes.outputs.ui }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github
+      - id: changes
+        uses: ./.github/actions/changes
+
+  discover-tests:
+    name: Discover Integration Tests
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.go != 'false' }}
+    runs-on: ubuntu-latest
+    outputs:
+      tests: ${{ steps.extract.outputs.tests }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Extract test cases
+        id: extract
+        run: |
+          tests=$(./.github/scripts/extract-integration-tests.sh | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "Found Tests: $tests"
+          {
+            echo "tests<<EOF"
+            echo "$tests"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+  build-cache:
+    name: Build and Cache Flipt Image
+    needs: changes
+    # Skip this job for docs-only changes, and for PRs from forks since they can't push to GHCR
+    if: |
+      !cancelled() &&
+      (needs.changes.outputs.go != 'false' || needs.changes.outputs.ui != 'false') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+      cached-image: ${{ steps.set-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+
+      - name: Generate Cache Key
+        id: cache-key
+        run: |
+          # Create cache key from git commit and relevant source files
+          # Suppress SIGPIPE error from find when head closes the pipe early
+          key="flipt-$(git rev-parse --short HEAD)-$(find . -name '*.go' -o -name 'go.*' -o -name '*.json' 2>/dev/null | head -20 | sort | xargs sha256sum | sha256sum | cut -d' ' -f1 | head -c 8)"
+          echo "key=$key" >> $GITHUB_OUTPUT
+          echo "Cache key: $key"
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if cache exists
+        id: cache-check
+        run: |
+          if docker manifest inspect ${{ env.REGISTRY_CACHE }}:${{ steps.cache-key.outputs.key }} >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Cache hit: Using existing image"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Cache miss: Will build new image"
+          fi
+
+      - name: Pre-pull base cache layers
+        if: steps.cache-check.outputs.exists == 'false'
+        env:
+          GO_VERSION: ${{ steps.mise_versions.outputs.go }}
+        run: |
+          # Pre-pull common base layers to speed up builds
+          echo "Pre-pulling base cache layers..."
+          docker pull ${{ env.REGISTRY_CACHE }}:golang-base-${{ env.GO_VERSION }} || echo "golang-base not cached yet"
+          docker pull ${{ env.REGISTRY_CACHE }}:node-base || echo "node-base not cached yet"
+          docker pull ${{ env.REGISTRY_CACHE }}:runtime-base || echo "runtime-base not cached yet"
+
+      - name: Build and Push Cache
+        id: build
+        if: steps.cache-check.outputs.exists == 'false'
+        uses: dagger/dagger-for-github@v7
+        with:
+          verb: call
+          version: ${{ steps.mise_versions.outputs.dagger }}
+          args: build --source . --registry-cache ${{ env.REGISTRY_CACHE }} --cache-tag ${{ steps.cache-key.outputs.key }}
+        env:
+          CI: true
+
+      - name: Push intermediate cache layers
+        if: steps.cache-check.outputs.exists == 'false'
+        run: |
+          # The intermediate layers (golang-base, node-base, runtime-base) 
+          # are automatically pushed during build-with-cache execution
+          # Go and npm dependencies use cache volumes for better performance
+          echo "Intermediate cache layers pushed during build process"
+
+      - name: Set cached image output
+        id: set-image
+        run: |
+          echo "image=${{ env.REGISTRY_CACHE }}:${{ steps.cache-key.outputs.key }}" >> $GITHUB_OUTPUT
+          echo "Using cached image: ${{ env.REGISTRY_CACHE }}:${{ steps.cache-key.outputs.key }}"
+
+  test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - discover-tests
+      - build-cache
+    if: |
+      !cancelled() &&
+      needs.discover-tests.result == 'success' &&
+      (needs.build-cache.result == 'success' || needs.build-cache.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        test: ${{ fromJson(needs.discover-tests.outputs.tests) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: echo "INTEGRATION_TEST_NAME=${{ matrix.test }}" | tr '/' '-' >> $GITHUB_ENV
+
+      - name: Log in to Container Registry
+        if: needs.build-cache.result == 'success'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Integration Tests with Cached Image
+        if: needs.build-cache.result == 'success'
+        uses: dagger/dagger-for-github@v7
+        with:
+          verb: call
+          version: ${{ steps.mise_versions.outputs.dagger }}
+          args: test --source . --cached-image "${{ needs.build-cache.outputs.cached-image }}" integration --cases="${{ matrix.test }}" --output-coverage=true export --path=coverage-${{ env.INTEGRATION_TEST_NAME }}
+
+      - name: Run Integration Tests without Cache (fork PRs)
+        if: needs.build-cache.result == 'skipped'
+        uses: dagger/dagger-for-github@v7
+        with:
+          verb: call
+          version: ${{ steps.mise_versions.outputs.dagger }}
+          args: test --source . integration --cases="${{ matrix.test }}" --output-coverage=true export --path=coverage-${{ env.INTEGRATION_TEST_NAME }}
+
+      - name: Process Coverage Data
+        if: always()
+        run: |
+          # Convert coverage data to text format for Codecov
+          if [ -d "coverage-${{ env.INTEGRATION_TEST_NAME }}" ]; then
+            go tool covdata textfmt -i=coverage-${{ env.INTEGRATION_TEST_NAME }} -o=coverage-${{ env.INTEGRATION_TEST_NAME }}.txt
+          fi
+
+      - name: Upload Coverage to Codecov
+        uses: codecov/codecov-action@v7
+        if: always()
+        with:
+          files: coverage-${{ env.INTEGRATION_TEST_NAME }}.txt
+          flags: integrationtests
+          name: integration-${{ env.INTEGRATION_TEST_NAME }}
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  ui:
+    name: UI Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - changes
+      - build-cache
+    if: |
+      !cancelled() &&
+      (needs.changes.outputs.go != 'false' || needs.changes.outputs.ui != 'false') &&
+      (needs.build-cache.result == 'success' || needs.build-cache.result == 'skipped')
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+
+      - name: Log in to Container Registry
+        if: needs.build-cache.result == 'success'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run UI Tests with Cached Image
+        if: needs.build-cache.result == 'success'
+        uses: dagger/dagger-for-github@v7
+        with:
+          verb: call
+          version: ${{ steps.mise_versions.outputs.dagger }}
+          args: test --source . --cached-image "${{ needs.build-cache.outputs.cached-image }}" ui
+
+      - name: Run UI Tests without Cache (fork PRs)
+        if: needs.build-cache.result == 'skipped'
+        uses: dagger/dagger-for-github@v7
+        with:
+          verb: call
+          version: ${{ steps.mise_versions.outputs.dagger }}
+          args: test --source . ui
+
+  # Single required status check for this workflow. Jobs skipped by change
+  # detection (including the whole integration test matrix) never report under
+  # their own names, so branch protection requires this job instead.
+  result:
+    name: "Integration Tests Result"
+    if: always()
+    needs: [changes, discover-tests, build-cache, test, ui]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check job results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' > /dev/null

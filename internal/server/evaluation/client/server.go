@@ -1,0 +1,220 @@
+package client
+
+import (
+	"context"
+	"time"
+
+	"go.flipt.io/flipt/errors"
+	"go.flipt.io/flipt/internal/server/common"
+	"go.flipt.io/flipt/internal/server/environments"
+	"go.flipt.io/flipt/internal/server/evaluation"
+	"go.flipt.io/flipt/internal/server/metrics"
+	rpcevaluation "go.flipt.io/flipt/rpc/v2/evaluation"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
+)
+
+// getCurrentEnvironment retrieves the environment by key. See evaluation.ResolveEnvironment for the fallback rules.
+func (s *Server) getCurrentEnvironment(ctx context.Context, key string) (environments.Environment, error) {
+	return evaluation.ResolveEnvironment(ctx, s.envs, key)
+}
+
+var _ rpcevaluation.ClientEvaluationServiceServer = (*Server)(nil)
+
+type Server struct {
+	logger *zap.Logger
+	envs   evaluation.EnvironmentStore
+
+	rpcevaluation.UnimplementedClientEvaluationServiceServer
+
+	skipOFREPAuthn bool
+	// authzEnabled opts into authorization for snapshot endpoints.
+	authzEnabled bool
+}
+
+type Option func(*Server)
+
+func WithSkipOFREPAuthn(skip bool) Option {
+	return func(s *Server) {
+		s.skipOFREPAuthn = skip
+	}
+}
+
+// WithAuthorizationEnabled opts into authorization for snapshot endpoints.
+func WithAuthorizationEnabled(enabled bool) Option {
+	return func(s *Server) {
+		s.authzEnabled = enabled
+	}
+}
+
+func NewServer(logger *zap.Logger, envs evaluation.EnvironmentStore, opts ...Option) *Server {
+	s := &Server{logger: logger, envs: envs}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// RegisterGRPC registers the *Server onto the provided grpc Server.
+func (s *Server) RegisterGRPC(server *grpc.Server) {
+	rpcevaluation.RegisterClientEvaluationServiceServer(server, s)
+}
+
+func (s *Server) EvaluationSnapshotNamespace(ctx context.Context, r *rpcevaluation.EvaluationNamespaceSnapshotRequest) (*rpcevaluation.EvaluationNamespaceSnapshot, error) {
+	start := time.Now()
+
+	env, err := s.getCurrentEnvironment(ctx, r.EnvironmentKey)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		environmentKey = env.Key()
+		namespaceKey   = r.Key
+
+		environmentAttr = metrics.AttributeEnvironment.String(environmentKey)
+		namespaceAttr   = metrics.AttributeNamespace.String(namespaceKey)
+
+		attrSet = attribute.NewSet(environmentAttr, namespaceAttr)
+	)
+
+	defer func() {
+		metrics.EvaluationsSnapshotLatency.Record(ctx, float64(time.Since(start).Milliseconds()), metric.WithAttributeSet(attrSet))
+	}()
+
+	metrics.EvaluationsSnapshotRequestsTotal.Add(ctx, 1, metric.WithAttributeSet(attrSet))
+
+	snap, err := env.EvaluationNamespaceSnapshot(ctx, namespaceKey)
+	if err != nil {
+		metrics.EvaluationsSnapshotErrorsTotal.Add(ctx, 1, metric.WithAttributeSet(attrSet))
+		return nil, err
+	}
+
+	md, ok := metadata.FromIncomingContext(ctx)
+	if ok && snap.Digest != "" {
+		etag := snap.Digest
+		// set etag header in the response
+		_ = grpc.SetHeader(ctx, metadata.Pairs("x-etag", etag))
+		// get If-None-Match header from request
+		if vals := md.Get("GrpcGateway-If-None-Match"); len(vals) > 0 && etag == vals[0] {
+			return &rpcevaluation.EvaluationNamespaceSnapshot{}, errors.ErrNotModifiedf("namespace %q", namespaceKey)
+		}
+	}
+
+	return &rpcevaluation.EvaluationNamespaceSnapshot{
+		Digest:    snap.Digest,
+		Namespace: snap.Namespace,
+		Flags:     snap.Flags,
+	}, nil
+}
+
+func (s *Server) EvaluationSnapshotNamespaceStream(r *rpcevaluation.EvaluationNamespaceSnapshotStreamRequest, stream rpcevaluation.ClientEvaluationService_EvaluationSnapshotNamespaceStreamServer) error {
+	var (
+		setupStart = time.Now()
+		ctx        = stream.Context()
+	)
+
+	if d := len(r.GetDigest()); d > 0 && d != 40 {
+		return errors.InvalidFieldError("digest", "must be a 40-character string")
+	}
+
+	env, err := s.getCurrentEnvironment(ctx, r.EnvironmentKey)
+	if err != nil {
+		return err
+	}
+
+	var (
+		// lastDigest tracks the digest of the last snapshot we sent
+		lastDigest = r.GetDigest()
+
+		environmentKey = env.Key()
+		namespaceKey   = r.Key
+
+		environmentAttr = metrics.AttributeEnvironment.String(environmentKey)
+		namespaceAttr   = metrics.AttributeNamespace.String(namespaceKey)
+
+		attrSet = attribute.NewSet(environmentAttr, namespaceAttr)
+	)
+
+	metrics.EvaluationsStreamRequestsTotal.Add(ctx, 1, metric.WithAttributeSet(attrSet))
+	metrics.EvaluationsStreamsInProgress.Add(ctx, 1, metric.WithAttributeSet(attrSet))
+
+	// start subscription with a channel with a buffer of one
+	// to allow the subscription to preload the last observed snapshot
+	ch := make(chan *rpcevaluation.EvaluationNamespaceSnapshot, 1)
+	closer, err := env.EvaluationNamespaceSnapshotSubscribe(ctx, namespaceKey, ch)
+
+	defer func() {
+		if closer != nil {
+			closer.Close()
+		}
+
+		metrics.EvaluationsStreamsInProgress.Add(ctx, -1, metric.WithAttributeSet(attrSet))
+	}()
+
+	if err != nil {
+		metrics.EvaluationsStreamErrorsTotal.Add(ctx, 1, metric.WithAttributeSet(attrSet))
+		metrics.EvaluationsStreamLatency.Record(ctx, float64(time.Since(setupStart).Milliseconds()), metric.WithAttributeSet(attrSet))
+		s.logger.Error("error subscribing to environment evaluation namespace snapshot", zap.Error(err), zap.String("namespace", namespaceKey), zap.String("environment", environmentKey))
+		return err
+	}
+
+	metrics.EvaluationsStreamLatency.Record(ctx, float64(time.Since(setupStart).Milliseconds()), metric.WithAttributeSet(attrSet))
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case snap, ok := <-ch:
+			if !ok {
+				return nil
+			}
+
+			if snap == nil {
+				s.logger.Debug("received nil snapshot, skipping")
+				continue
+			}
+
+			// only send the snapshot if we have a new digest
+			if snap.Digest != lastDigest {
+				if err := stream.Send(snap); err != nil {
+					metrics.EvaluationsStreamErrorsTotal.Add(ctx, 1, metric.WithAttributeSet(attrSet))
+					s.logger.Error("error sending evaluation namespace snapshot", zap.Error(err), zap.String("namespace", namespaceKey), zap.String("environment", environmentKey))
+					return err
+				}
+				metrics.EvaluationsStreamMessagesTotal.Add(ctx, 1, metric.WithAttributeSet(attrSet))
+				lastDigest = snap.Digest
+			}
+		}
+	}
+}
+
+func (s *Server) SkipsAuthorization(ctx context.Context) bool {
+	return !s.authzEnabled
+}
+
+func (s *Server) SkipsAuthentication(ctx context.Context) bool {
+	if !s.skipOFREPAuthn {
+		return false
+	}
+
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return false
+	}
+
+	if vals := md.Get(common.HeaderFliptOFREPStream); len(vals) == 0 || vals[0] != "true" {
+		return false
+	}
+
+	p, ok := peer.FromContext(ctx)
+	if !ok || p.Addr.Network() != "inproc" {
+		return false
+	}
+
+	return true
+}

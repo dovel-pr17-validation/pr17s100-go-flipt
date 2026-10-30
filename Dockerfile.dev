@@ -1,0 +1,24 @@
+FROM golang:1.27-alpine
+
+WORKDIR /server
+
+RUN apk add --update --no-cache git bash gcc build-base binutils-gold curl
+
+RUN curl https://mise.run | sh && \
+  ln -s /root/.local/bin/mise /usr/local/bin/mise
+
+COPY .mise.toml .
+COPY go.mod .
+COPY go.sum .
+COPY ./errors ./errors
+COPY ./rpc ./rpc
+COPY ./sdk ./sdk
+COPY ./core ./core
+
+RUN go mod download -x
+
+RUN mkdir -p /etc/flipt && \
+  mkdir -p /var/opt/flipt
+
+EXPOSE 8080
+EXPOSE 9000

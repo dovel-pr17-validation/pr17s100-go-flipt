@@ -1,0 +1,120 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - depguard
+    - durationcheck
+    - errchkjson
+    - errorlint
+    - gocheckcompilerdirectives
+    - gochecksumtype
+    - gocritic
+    - gosec
+    - gosmopolitan
+    - loggercheck
+    - makezero
+    - misspell
+    - modernize
+    - nilerr
+    - nilnesserr
+    - noctx
+    - reassign
+    - rowserrcheck
+    - spancheck
+    - sqlclosecheck
+    - staticcheck
+    - testifylint
+    - unconvert
+    - unparam
+    - usetesting
+    - zerologlint
+  disable:
+    - goconst
+    - contextcheck
+    - exhaustive
+    - musttag
+    - protogetter
+    - recvcheck
+  settings:
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: github.com/pkg/errors
+              desc: Should be replaced by standard lib errors package
+    gosec:
+      excludes:
+        - G501
+        - G401
+        - G404
+        - G602
+        - G115
+        - G124
+    staticcheck:
+      checks:
+        - "-SA1019"
+        - "-ST1003"
+        - "-QF1008"
+        - all
+    modernize:
+      disable:
+        - omitzero
+        - stringsbuilder
+    usetesting:
+      context-background: true
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - path: (.+)\.go$
+        text: composite literal uses unkeyed fields
+      - linters:
+          - goconst
+        path: (.+)_test\.go
+      - text: "SA1019: "
+        linters:
+          - staticcheck
+      - text: "ST1003: "
+        linters:
+          - staticcheck
+      - text: "QF1008: "
+        linters:
+          - staticcheck
+      - text: "G101: "
+        path: (.+)_test\.go
+        linters:
+          - gosec
+    paths:
+      - .*pb.go
+      - bin
+      - _tools
+      - dist
+      - rpc/flipt
+      - ui
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+    - gofumpt
+
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+      - (.+)_mock\.go$

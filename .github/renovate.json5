@@ -1,0 +1,22 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  // main is the v1 maintenance line: only raise PRs for known vulnerabilities.
+  // Regular version bumps were rebasing on every merge and re-running the full
+  // CI suite (~40% of Actions minutes in Sept 2026).
+  extends: ["config:recommended", "security:only-security-updates"],
+  dependencyDashboardApproval: false,
+  baseBranchPatterns: ["main"],
+  timezone: "America/New_York",
+  labels: ["dependencies", "security", "automerge"],
+  postUpdateOptions: ["gomodTidy"],
+  // Only rebase when a PR actually conflicts, so one merge doesn't re-trigger CI
+  // on every other open PR.
+  rebaseWhen: "conflicted",
+  packageRules: [
+    {
+      matchManagers: ["gomod"],
+      enabled: false,
+      matchPackageNames: ["/^go\\.flipt\\.io/flipt/.*/"],
+    },
+  ],
+}

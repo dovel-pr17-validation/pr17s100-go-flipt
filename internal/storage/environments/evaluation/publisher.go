@@ -1,0 +1,205 @@
+package evaluation
+
+import (
+	"context"
+	"errors"
+	"io"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	storagefs "go.flipt.io/flipt/internal/storage/fs"
+	rpcevaluation "go.flipt.io/flipt/rpc/v2/evaluation"
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
+)
+
+type SnapshotPublisher interface {
+	Publish(snap *storagefs.Snapshot) error
+	Subscribe(ctx context.Context, ns string, ch chan<- *rpcevaluation.EvaluationNamespaceSnapshot) (io.Closer, error)
+}
+
+type subscription struct {
+	logger *zap.Logger
+	mu     sync.Mutex
+	finish func()
+	ch     chan<- *rpcevaluation.EvaluationNamespaceSnapshot
+	id     string
+}
+
+func (s *subscription) send(ctx context.Context, snap *rpcevaluation.EvaluationNamespaceSnapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.ch == nil {
+		return errors.New("subscription has been closed")
+	}
+
+	if snap == nil {
+		return nil
+	}
+
+	select {
+	case s.ch <- snap:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *subscription) Close() error {
+	// remove the subscription from the publishable list
+	s.finish()
+
+	// close and remove the channel from the subscription
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	close(s.ch)
+	s.ch = nil
+
+	return nil
+}
+
+// publishOptions provides configuration options for the publish operation
+type publishOptions struct {
+	// timeout is the maximum time to wait for a subscriber to accept a message
+	// Default is 5 seconds if not specified
+	timeout time.Duration
+
+	// maxConcurrency is the maximum number of concurrent goroutines for publishing
+	// Default is 100 if not specified
+	maxConcurrency int
+}
+
+type Publisher struct {
+	logger *zap.Logger
+	ctx    context.Context
+
+	mu   sync.Mutex
+	last *rpcevaluation.EvaluationSnapshot
+	subs map[string][]*subscription
+
+	options publishOptions
+}
+
+type OptionsFunc func(options *publishOptions)
+
+func WithTimeout(timeout time.Duration) OptionsFunc {
+	return func(options *publishOptions) {
+		options.timeout = timeout
+	}
+}
+
+func NewSnapshotPublisher(ctx context.Context, logger *zap.Logger, opts ...OptionsFunc) *Publisher {
+	options := publishOptions{
+		timeout:        15 * time.Second,
+		maxConcurrency: 100,
+	}
+
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	return &Publisher{
+		ctx:     ctx,
+		logger:  logger,
+		subs:    make(map[string][]*subscription),
+		options: options,
+	}
+}
+
+func (p *Publisher) Publish(snap *storagefs.Snapshot) error {
+	ctx := p.ctx
+	last, err := snap.EvaluationSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	p.last = last
+	// Snapshot subscriptions under lock so we can publish without holding the mutex.
+	subsByNamespace := make(map[string][]*subscription, len(p.subs))
+	for k, v := range p.subs {
+		subs := make([]*subscription, len(v))
+		copy(subs, v)
+		subsByNamespace[k] = subs
+	}
+	p.mu.Unlock()
+
+	g := errgroup.Group{}
+	g.SetLimit(p.options.maxConcurrency)
+
+	for ns, subs := range subsByNamespace {
+		for _, sub := range subs {
+			if sub == nil {
+				continue
+			}
+
+			snapshot := last.Namespaces[ns]
+
+			g.Go(func() error {
+				p.logger.Debug("sending update",
+					zap.String("subscription", sub.id),
+					zap.String("namespace", ns))
+
+				subCtx, cancel := context.WithTimeout(ctx, p.options.timeout)
+				defer cancel()
+
+				if err := sub.send(subCtx, snapshot); err != nil {
+					p.logger.Error("error sending update",
+						zap.String("subscription", sub.id),
+						zap.String("namespace", ns),
+						zap.Error(err))
+					return err
+				}
+				return nil
+			})
+		}
+	}
+
+	if err := g.Wait(); err != nil {
+		p.logger.Warn("some subscriptions failed to receive updates",
+			zap.Error(err))
+	}
+
+	return nil
+}
+
+func (p *Publisher) Subscribe(ctx context.Context, ns string, ch chan<- *rpcevaluation.EvaluationNamespaceSnapshot) (io.Closer, error) {
+	var (
+		id  = uuid.New().String()
+		sub = &subscription{id: id, ch: ch, logger: p.logger.With(zap.String("subscription", id))}
+	)
+
+	sub.finish = func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
+		for i, s := range p.subs[ns] {
+			if s.id == sub.id {
+				p.subs[ns] = slices.Delete(p.subs[ns], i, i+1)
+				break
+			}
+		}
+		if len(p.subs[ns]) == 0 {
+			delete(p.subs, ns)
+		}
+
+		sub.logger.Debug("subscription canceled")
+	}
+
+	p.mu.Lock()
+	// send initial snapshot if one has already been observed
+	if p.last != nil {
+		if err := sub.send(ctx, p.last.Namespaces[ns]); err != nil {
+			sub.logger.Error("error sending to subscriber", zap.Error(err))
+		}
+	}
+	p.subs[ns] = append(p.subs[ns], sub)
+	p.mu.Unlock()
+
+	sub.logger.Debug("subscription created")
+	return sub, nil
+}

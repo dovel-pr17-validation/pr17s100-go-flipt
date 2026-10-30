@@ -1,0 +1,13 @@
+# .kodiak.toml
+version = 1
+
+[approve]
+auto_approve_usernames = ["renovate", "dependabot"]
+
+[update]
+always = true
+ignored_usernames = ["renovate", "dependabot"]
+
+[merge]
+method = "squash"
+notify_on_conflict = true

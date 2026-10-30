@@ -1,0 +1,326 @@
+[tools]
+go = "1.27"
+node = "24"
+golangci-lint = "2.14.0"
+buf = "1.72.0"
+dagger = "0.21.9"
+
+[tasks.bootstrap]
+description = "Install required development tools"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Bootstrapping tools..."
+(cd internal/cmd/protoc-gen-go-flipt-sdk && go install .)
+go install tool
+(cd internal/cmd/protoc-gen-flipt-openapi && go install .)
+go install tool
+"""
+
+[tasks.clean]
+description = "Clean built files and tidy go.mod"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Cleaning..."
+go mod tidy
+rm -rf dist/* pkg/* bin/* ui/dist
+"""
+
+[tasks."ui:deps"]
+description = "Install UI dependencies"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Installing UI deps..."
+cd ui
+if [ ! -d node_modules ]; then
+  npm ci
+else
+  npx --yes package-changed install --ci
+fi
+"""
+
+[tasks."ui:build"]
+description = "Build UI assets for release"
+depends = ["ui:deps"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Building UI assets..."
+cd ui
+npm run build
+"""
+
+[tasks."ui:dev"]
+description = "Run UI in development mode"
+depends = ["ui:deps"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Starting UI..."
+cd ui
+npm run dev
+"""
+
+[tasks."ui:fmt"]
+description = "Format UI code with Prettier"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Formatting UI..."
+cd ui
+npm run format
+"""
+
+[tasks."ui:lint"]
+description = "Lint UI code with ESLint"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Linting UI..."
+cd ui
+npm run lint
+"""
+
+[tasks.prep]
+description = "Prepare project for building (clean + ui:build)"
+depends = ["clean"]
+run = """
+mise run ui:build
+echo " > Prepared."
+"""
+
+[tasks.build]
+description = "Build the project similar to a release build"
+depends = ["prep"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Building..."
+
+BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+GIT_COMMIT=$(git rev-parse HEAD)
+
+LDFLAGS="-X main.commit=${GIT_COMMIT} -X main.date=${BUILD_DATE}"
+
+if [ -n "${KEYGEN_VERIFY_KEY:-}" ]; then
+  LDFLAGS="${LDFLAGS} -X main.keygenVerifyKey=${KEYGEN_VERIFY_KEY}"
+fi
+if [ -n "${KEYGEN_ACCOUNT_ID:-}" ]; then
+  LDFLAGS="${LDFLAGS} -X main.keygenAccountID=${KEYGEN_ACCOUNT_ID}"
+fi
+if [ -n "${KEYGEN_PRODUCT_ID:-}" ]; then
+  LDFLAGS="${LDFLAGS} -X main.keygenProductID=${KEYGEN_PRODUCT_ID}"
+fi
+
+go build -trimpath -tags assets -ldflags "${LDFLAGS}" -o ./bin/flipt ./cmd/flipt/
+
+echo ""
+echo "Run the following to start Flipt:"
+echo ""
+echo "  ./bin/flipt server [--config config/local.yml]"
+"""
+
+[tasks."go:build"]
+description = "Build Go server for development without bundling assets"
+depends = ["clean"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Building..."
+
+BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+GIT_COMMIT=$(git rev-parse HEAD)
+
+LDFLAGS="-X main.commit=${GIT_COMMIT} -X main.date=${BUILD_DATE}"
+
+if [ -n "${KEYGEN_VERIFY_KEY:-}" ]; then
+  LDFLAGS="${LDFLAGS} -X main.keygenVerifyKey=${KEYGEN_VERIFY_KEY}"
+fi
+if [ -n "${KEYGEN_ACCOUNT_ID:-}" ]; then
+  LDFLAGS="${LDFLAGS} -X main.keygenAccountID=${KEYGEN_ACCOUNT_ID}"
+fi
+if [ -n "${KEYGEN_PRODUCT_ID:-}" ]; then
+  LDFLAGS="${LDFLAGS} -X main.keygenProductID=${KEYGEN_PRODUCT_ID}"
+fi
+
+go build -trimpath -ldflags "${LDFLAGS}" -o ./bin/flipt ./cmd/flipt/
+
+echo ""
+echo "Run the following to start Flipt server:"
+echo ""
+echo "  ./bin/flipt server [--config config/local.yml]"
+echo ""
+echo "In another shell, run the following to start the UI in dev mode:"
+echo ""
+echo "  cd ui && npm run dev"
+"""
+
+[tasks.dev]
+description = "Run Go server in development mode with local config"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG="config/dev.yml"
+if [ ! -f "$CONFIG" ]; then
+  CONFIG="config/local.yml"
+fi
+exec go run ./cmd/flipt/... server --config "$CONFIG"
+"""
+
+[tasks."go:test"]
+alias = "test"
+description = "Run Go unit tests"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Testing..."
+
+ARGS=(-v -covermode=atomic -count=1 -coverprofile=coverage.txt -timeout=60s -coverpkg=./...)
+
+if [ -n "${FLIPT_TEST_SHORT:-}" ]; then
+  ARGS+=(-short)
+fi
+
+go tool github.com/rakyll/gotest "${ARGS[@]}" ./...
+"""
+
+[tasks."go:bench"]
+alias = "bench"
+description = "Run Go benchmarks"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Running benchmarks..."
+go test -run XXX -bench . -benchmem -short ./...
+"""
+
+[tasks."go:cover"]
+description = "Run tests and generate coverage report"
+depends = ["go:test"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Running coverage..."
+go tool cover -html=coverage.txt
+"""
+
+[tasks."go:fmt"]
+alias = "fmt"
+description = "Format Go code with goimports"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Formatting..."
+golangci-lint fmt
+buf format --write
+"""
+
+[tasks."go:lint"]
+alias = "lint"
+description = "Run Go linters (golangci-lint and buf)"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Linting..."
+golangci-lint run
+buf lint
+"""
+
+[tasks."go:hawk"]
+description = "Run gohawk"
+tools = { "github:kojah/gohawk" = "0.3.6" }
+run = "gohawk -json -enable-all ./..."
+
+[tasks."go:modernize"]
+description = "Apply modern Go idioms"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Running modernize..."
+# run the same modernize analyzers that CI runs, so the set of enabled
+# analyses lives only in .golangci.yml
+golangci-lint run --default=none -E modernize --fix ./...
+"""
+
+[tasks."go:proto"]
+alias = "proto"
+description = "Generate protobuf files and gRPC stubs"
+depends = ["bootstrap"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Generating proto files..."
+
+for module in rpc/flipt rpc/v2; do
+  (cd "$module" && buf generate)
+done
+
+(cd rpc/v2 && buf generate --path environments/environments.proto --template environments/buf.gen.yaml)
+(cd rpc/v2 && buf generate --path evaluation/evaluationv2.proto --template evaluation/buf.gen.yaml)
+"""
+
+[tasks."go:mockery"]
+description = "Generate mocks"
+tools = { mockery = "3.8.1" }
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Generating mocks..."
+mockery
+"""
+
+[tasks."go:fuzz"]
+alias = "fuzz"
+description = "Run Go fuzz tests (set FLIPT_FUZZ_TIME to control duration, default 10s per target)"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+echo " > Running fuzz tests..."
+
+FUZZ_TIME="${FLIPT_FUZZ_TIME:-10s}"
+
+# find_module_root returns the nearest parent directory containing a go.mod
+find_module_root() {
+  local dir="$1"
+  while [ "$dir" != "." ] && [ "$dir" != "/" ]; do
+    if [ -f "$dir/go.mod" ]; then
+      echo "$dir"
+      return
+    fi
+    dir="$(dirname "$dir")"
+  done
+  echo "."
+}
+
+# Find all packages containing fuzz tests, then run each fuzz target
+grep -rl --include='*_test.go' 'func Fuzz' . | while read -r file; do
+  dir="$(dirname "$file")"
+  mod_root="$(find_module_root "$dir")"
+  # Get the package path relative to the module root
+  pkg_rel="./${dir#"$mod_root"}"
+  pkg_rel="${pkg_rel#./}"
+  [ -z "$pkg_rel" ] && pkg_rel="."
+  pkg_rel="./$pkg_rel"
+
+  grep -o 'func Fuzz[A-Za-z0-9_]*' "$file" | sed 's/^func //' | while read -r func; do
+    echo " > Running $func in $mod_root ($pkg_rel) for $FUZZ_TIME..."
+    (cd "$mod_root" && go test -run='^$' -fuzz="^${func}$" -fuzztime="$FUZZ_TIME" -timeout=0 "$pkg_rel")
+  done
+done
+"""
+
+[tasks."dagger:integration"]
+alias = "di"
+description = "Run a Dagger integration test by name (e.g. mise di signing/azure)"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+dagger call test --source . integration --cases="$*"
+"""
+
+[tasks."go:generate"]
+description = "Generate mocks and proto files"
+depends = ["go:mockery", "go:proto"]
+run = 'echo " > Generation complete."'

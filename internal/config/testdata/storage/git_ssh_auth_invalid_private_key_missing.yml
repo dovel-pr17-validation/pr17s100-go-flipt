@@ -1,0 +1,11 @@
+storage:
+  default:
+    remote: "git@github.com:foo/bar.git"
+    credentials: default
+
+credentials:
+  default:
+    type: ssh
+    ssh:
+      user: foo
+      password: bar

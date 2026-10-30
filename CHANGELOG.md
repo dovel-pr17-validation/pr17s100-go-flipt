@@ -1,0 +1,540 @@
+# Changelog
+
+This format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [2.14.1](https://github.com/flipt-io/flipt/releases/tag/v2.14.1) - 2026-10-22
+
+### Added
+
+- **Kubernetes authentication (security)**: Set `authentication.methods.kubernetes.audiences` to accept only service account tokens carrying one of those audiences (an exact, case-sensitive match). Use it with a projected service account token minted for Flipt, so tokens issued to other services in the cluster (for example, for Vault) are rejected. Keep `service_account_token_path` on Flipt's default token. Without `audiences`, any token the cluster issues is accepted as before, and Flipt logs a warning at startup (#6679)
+
+### Changed
+
+- **Authorization (upgrade note)**: When authorization is required, the authentication management APIs (`ListAuthentications`, `GetAuthentication`, `DeleteAuthentication`) now need the new `authentication` scope. Before upgrading, add `read` or `delete` on `authentication` to the policies of any callers that list, read, or delete sessions, or they will be denied. Global access already covers it, and the `*Self` endpoints used by the UI are unaffected (#6679)
+
+### Fixed
+
+- **Authorization (security)**: The authentication management APIs (`ListAuthentications`, `GetAuthentication`, `DeleteAuthentication`) are now checked against policy when authorization is required. Previously any authenticated caller could list, read, and delete every stored session. Policies must now grant the new `authentication` scope (`read` or `delete`), which has no environment or namespace; global access already covers it. The `*Self` endpoints used by the UI are unaffected (#6679)
+- **Analytics (security)**: Escape environment, namespace, and flag keys in Prometheus analytics queries. Keys from the request were inserted into PromQL unescaped, so a caller could change the query and read any metric the configured Prometheus holds (#6679)
+- **Authorization (security)**: The analytics APIs are now checked against policy when authorization is required. Previously any authenticated caller could read evaluation counts for any environment and namespace. Both analytics requests now need `read` on the namespace, the same permission as viewing its flags (#6679)
+- **Namespaces (security)**: Validate namespace keys. Keys containing `/`, `\`, or NUL, or starting with `.` (such as `..` or `.git`), are rejected on every namespace and resource request, because they were used as directory paths in the environment's storage. New namespaces must also use only letters, numbers, hyphens, and underscores. Existing namespaces with other keys can still be read, updated, and deleted so they can be cleaned up; such keys already fail `flipt validate` and stop the environment's evaluation snapshot from updating. Nested namespaces created before this fix (for example `a/b/features.yaml`) must be removed from the repository by hand (#6679)
+- **Authorization (security)**: `ListFlags` now authorizes the environment it serves. Previously, a request whose `X-Flipt-Environment` header named a different environment from its `environment_key` was authorized against `environment_key` but listed the flags of the header's environment. The header still takes precedence (#6679)
+- **Authorization (security)**: Batch evaluation now authorizes the environment it serves. A batch item with a blank `environment_key` was authorized as `default` but evaluated against the `X-Flipt-Environment` header's environment. Blank keys on batch items are now filled from the `X-Flipt-Environment` and `X-Flipt-Namespace` headers before authorization, as they already were for single evaluations (#6679)
+- **Authorization (security)**: When authorization is required, evaluation and client snapshot requests whose `environment_key` names an environment that does not exist now fail with not found. Previously they were authorized against the requested key but served the `X-Flipt-Environment` header's environment or the default environment. Without authorization, unknown keys still fall back as before, and a blank key falls back in both cases (#6679)
+- **Authorization**: Log expected authorization denials at warn instead of error, with the environment, namespace, authentication ID, and authentication method. Policy engine errors stay at error (#6675)
+
+### Dependencies
+
+- Updated various Go and UI dependencies, including gRPC, chi, Azure SDK, and React.
+
+## [2.14.0](https://github.com/flipt-io/flipt/releases/tag/v2.14.0) - 2026-10-15
+
+### Breaking
+
+- **Secrets providers**: The `aws`, `gcp`, and `azure` secrets providers now require a Pro license, as `vault` already did. Without one, enabling any of them fails startup with `<provider> secrets provider requires a paid license` (for example, `aws secrets provider requires a paid license`), and the provider is never set up or contacted. OSS users of these providers should move their secrets to the `file` provider.
+- **License secrets**: Secret references in `license.key`, `license.file`, and `license.machine_id` may now only use the `file` provider, because the license is determined before any Pro secrets provider is set up. Pro users who load these values from `vault`, `aws`, `gcp`, or `azure` must switch to the `file` provider or set the value directly (for example, `FLIPT_LICENSE_KEY`).
+
+### Added
+
+- **SCM webhooks (Pro)**: Receive incoming push webhooks from your SCM provider to sync environments right away, without waiting for the next poll (#6643)
+- **Evaluation authorization**: Opt in to policy checks on the evaluation, snapshot, and OFREP APIs with `authorization.exclude.evaluation` and `authorization.exclude.ofrep` (both default to `true`). A new `evaluate` action lets namespace-scoped tokens evaluate flags without management read access (#6661)
+
+### Fixed
+
+- **Authorization (security)**: Close a scope bypass on list endpoints. `ListNamespaces` now hides environments excluded by `viewable_environments`, and undefined list scopes fall back to the allow decision instead of returning an unrestricted list (#6662)
+- **Authorization**: Honor environment scopes defined in policy data (#6639)
+- **Variants**: Allow empty variant keys and reject duplicate variant keys within a flag (#6666)
+- **Git storage**: Refetch the branch before reporting a head revision conflict, fixing false conflicts in multi-instance deployments (#6646)
+- **GitLab SCM**: Support GitLab without credentials, and make `scm.credentials` optional in the config schemas (#6644)
+- **Metrics**: Stop serving `/metrics` when metrics are disabled (#6642)
+
+### Dependencies
+
+- Updated various Go and UI dependencies, including OpenTelemetry, AWS SDK, Azure SDK, go-git, Prometheus, Redis, and CodeMirror.
+
+## [2.13.1](https://github.com/flipt-io/flipt/releases/tag/v2.13.1) - 2026-10-02
+
+### Fixed
+
+- **Management authorization**: Correct branch create, propose, and delete authorization actions, and make environment and namespace list filtering fail closed when authorization is enforced (#6567)
+- **Cross-origin protection**: Respect authentication exclusion for evaluation and OFREP POST routes, fixing 403s for browser-based evaluation (#6608)
+- **Evaluation**: Always return the flag key for boolean evaluations, including disabled flags without rollouts (#6622)
+- **Git push recovery**: Recover from false non-fast-forward push rejections (#6637)
+- **Git environments**: Guard branched environments from replacing static environments, harden stale-revision push retries, and recover branched environments after an initial snapshot failure (#6592, #6603)
+- **Git storage**: Store the evaluation snapshot before publishing it, and return an error when HEAD cannot be resolved (#6605, #6611)
+- **Analytics**: Store boolean evaluation values as `true`/`false` (#6604)
+- **Snapshots**: Keep the full SHA-1 digest for multi-doc namespaces so server-issued digests pass stream validation (#6593)
+- **UI OIDC login**: Restore the requested deep link after OIDC login (#6586)
+- **Auth**: Return decoded auth data and stop tickers on shutdown (#6561)
+
+### Dependencies
+
+- Updated various Go and UI dependencies, including gRPC, AWS SDK, Google APIs, go-github, CodeMirror, and Vite.
+
+## [2.13.0](https://github.com/flipt-io/flipt/releases/tag/v2.13.0) - 2026-09-20
+
+### Added
+
+- **gRPC service readiness**: Report per-service health readiness for management and evaluation (#6559)
+- **OIDC discovery URLs**: Support providers whose discovery document is hosted at a URL different from the issuer (#6525)
+- **OIDC claims mapping**: Map non-standard ID token claims to Flipt session fields (#6519)
+
+### Fixed
+
+- **Legacy feature files**: Preserve validation for versionless files after schema default changes (#6547)
+- **License validation**: Enforce expiry consistently and harden offline license validation (#6539)
+- **Evaluation**: Return `FLAG_DISABLED` for disabled boolean flags without rollouts (#6515)
+- **Git environment refs**: Use git-safe environment names for branch refs (#6508)
+- **UI comboboxes**: Match options by display name, not only key (#6550)
+- **UI variant deletion**: Allow cancellation to undo variant deletion (#6435)
+
+### Dependencies
+
+- Updated various dependencies, including AWS SDK, CodeMirror, React Router, Vite, Playwright, Google APIs, OPA, OAuth, and other Go and UI packages.
+
+## [2.12.0](https://github.com/flipt-io/flipt/releases/tag/v2.12.0) - 2026-09-05
+
+### Added
+
+- **Cross-environment segment copying**: Allow segments to be copied across environments (#6467)
+- **JWT claims metadata**: Expose full JWT claims as `io.flipt.auth.claims` metadata (#6361)
+- **OIDC front-channel logout**: Add front-channel logout support (#6164)
+
+### Fixed
+
+- **JSON Schema validation**: Correct JSON Schema meta-schema keywords (#6449)
+- **SSH host key validation**: Make `insecure_ignore_host_key` work without a `known_hosts` file (#6427)
+- **Authorization**: Authorize v2 create RPCs as create operations (#6402)
+- **Batch evaluation**: Return per-request error responses in `Batch` (#6262)
+- **HTTP paths**: Reject invalid UTF-8 request paths (#6338)
+- **Validation**: Correct the less-than operator from `le` to `lt` in the schema (#6304)
+- **SSE invalidation**: Guard namespace local storage and use selectors for SSE invalidation (#6257)
+
+### Changed
+
+- **UI code quality**: Modernize UI code for ESLint 10 and React best practices (#6227)
+
+### Documentation
+
+- **UI architecture documentation**: Fix a compatibility spelling error (#6404)
+
+### Dependencies
+
+- Updated various dependencies, including gRPC, AWS and Azure SDKs, OpenTelemetry, OPA, React Router, Vite, Playwright, and other Go and UI packages.
+
+## [2.11.0](https://github.com/flipt-io/flipt/releases/tag/v2.11.0) - 2026-07-17
+
+### Added
+
+- **OIDC Single Logout**: Add OpenID Connect Single Logout (SLO) support (#6125)
+- **OIDC authorization parameters**: Support custom authorization parameters in OIDC provider configuration (#6126)
+- **Environment PR titles**: Allow users to customize pull request titles (#6123)
+- **Flag copying**: Allow flags to be copied across environments (#5772)
+- **Segment reference visibility**: Show flags that reference a segment (#6145)
+- **YAML extension constraints**: Serialize `isoneof` constraint values as YAML lists (#6072)
+
+### Changed
+
+- **Revision tracking**: Move UI revision tracking to the per-environment transport layer and use per-query revisions (#6108, #6106)
+- **Flag evaluation performance**: Improve flag evaluation speed (#6023)
+- **Table search responsiveness**: Replace the Searchbox debounce with `useDeferredValue` (#6173)
+- **Build tooling**: Upgrade build tooling to Node.js 24 (#6073)
+
+### Fixed
+
+- **Git updates**: Retry non-fast-forward Git reference updates (#6207)
+- **Namespace concurrency**: Add namespace ETag support across storage backends (#6041)
+- **Evaluation metrics**: Record evaluation metrics only when the `WithMetrics` option is enabled (#6042)
+- **Redis logging**: Route internal go-redis logs through zap (#6132)
+- **gRPC authentication logging**: Log "authentication required" messages at WARN level (#6198)
+- **UI component initialization**: Lazily initialize state in metadata and flag-copy panels (#6171)
+
+### Security
+
+- **Container dependencies**: Patch container and Docker dependency CVEs (#6163)
+
+### Dependencies
+
+- Updated various dependencies including gRPC, gRPC Gateway, Google APIs, OPA, CUE, AWS SDK, Go Cloud, ClickHouse, OIDC, React, React Router, Radix UI, CodeMirror, Tailwind, Vite, Playwright, PostCSS, and GitHub Actions
+
+## [2.10.0](https://github.com/flipt-io/flipt/releases/tag/v2.10.0) - 2026-06-12
+
+### Added
+
+- **Bulk constraint editing**: Add bulk edit mode for constraints in the UI (#6017)
+
+### Changed
+
+- **Snapshot stream efficiency**: Skip sending evaluation snapshots when the client digest already matches (#5909)
+- **Evaluation snapshot compatibility**: Deprecate `name` and `description` in evaluation snapshots (#5990)
+
+### Fixed
+
+- **Number constraint evaluation**: Refactor number constraint evaluation to use nil checks consistently (#6018)
+- **CUE validation**: Fix validation for boolean rollouts and null descriptions (#5385)
+- **Profiling diagnostics**: Disable profiling diagnostics by default (#5991)
+- **OFREP streaming**: Add the new SSE event stream endpoint, conditional request support, and correct bulk event stream metadata (#5957, #5669)
+- **SSH credentials**: Preserve non-default SSH ports in remote URLs (#5945)
+- **Snapshot stream digest reverts**: Avoid suppressing digest reverts in the snapshot stream (#5923)
+- **Kubernetes auth claims**: Correct the JSON struct tag for expiration claims (#5908)
+- **UI flag keys**: Allow camelCase flag keys in the UI (#5917)
+- **OpenAPI generation**: Improve OpenAPI generation and inject missing schemas into the gnostic generator (#5823, #5825)
+
+### Dependencies
+
+- Updated various dependencies including go-git, go-billy, AWS SDK, Azure SDK, OpenTelemetry, gRPC, Redis, ClickHouse, testcontainers, React Router, React DOM, Redux Toolkit, Radix UI, CodeMirror, Tailwind, Playwright, and GitHub Actions
+
+## [2.9.0](https://github.com/flipt-io/flipt/releases/tag/v2.9.0) - 2026-04-22
+
+### Added
+
+- **Real-time updates for UI and OFREP**: Implement Server-Sent Events (SSE) for live UI and OFREP evaluation updates (#5617)
+- **Buf publishing for v2 protobufs**: Publish Flipt v2 protobuf definitions to `buf.io/v2` (#5589)
+- **Devcontainer support**: Add a devcontainer setup for Flipt v2 development environments (#5542)
+
+### Changed
+
+- **Rollout distribution normalization**: Normalize rollout distribution buckets for more consistent rollout behavior (#5581)
+- **Build tooling migration**: Migrate build tooling and CI workflows from Mage to Mise (#5504, #5519)
+- **gRPC middleware modernization**: Migrate `grpc-middleware` from v1 to v2 (#5668)
+- **UI bundle optimization**: Reduce bundle size by removing heavier UI dependencies (#5682)
+
+### Fixed
+
+- **OIDC profile fallback**: Use UserInfo claims as a fallback when required OIDC fields are missing (#5692)
+- **Unauthenticated UI requests**: Skip environment API calls and SSE subscriptions when the user is not authenticated (#5670)
+- **Authentication cookie cleanup**: Add `HttpOnly` and `Secure` attributes when clearing auth cookies (#5655)
+- **GitHub OAuth and OIDC nonce handling**: Fix PKCE challenge generation for GitHub and correct OIDC nonce behavior (#5647)
+- **Generated SDK HTTP client**: Add the `Content-Type` header and improve generated HTTP client error messages (#5560)
+- **Key generation**: Preserve trailing separators in generated keys (#5594)
+- **Snapshot publishing and rule evaluation**: Fix snapshot publisher subscriptions and correct constraint short-circuiting (#5565)
+
+### Security
+
+- **TLS configuration hardening**: Address a CodeQL warning about insecure TLS configuration (#5614)
+
+### Dependencies
+
+- Updated various dependencies including go-git v6, OpenTelemetry, gRPC, Google and AWS SDKs, Vault, OIDC libraries, and UI packages such as React Router, React DOM, MUI, CodeMirror, Tailwind, Vite, and Playwright
+
+## [2.8.0](https://github.com/flipt-io/flipt/releases/tag/v2.8.0) - 2026-03-06
+
+### Added
+
+- **Secret management providers**: Added support for external secret management providers, enabling secrets to be stored and retrieved from cloud-native services instead of local files:
+  - AWS Secrets Manager (#5411)
+  - GCP Secret Manager (#5404)
+  - Azure Key Vault (#5428)
+- **Configurable machine fingerprint**: Support configurable machine fingerprint for container environments to improve license activation reliability (#5427)
+
+### Fixed
+
+- **CI Node version**: Bump Node.js version from 18 to 20 in CI workflows (#5501)
+- **Integration test environment key**: Set EnvironmentKey on evaluation requests in environment integration tests (#5499)
+- **Authentication cookie forwarding**: Forward state and token cookies to distinct metadata keys during OIDC authentication to prevent cookie collision issues (#5479)
+- **UI key validation**: Sanitize generated keys and show key validation errors on first edit (#5434)
+- **UI toggle styling**: Remove background brand class for unchecked toggle state (#5430)
+- **UI threshold default**: Use 0 as default threshold percentage in quick edit form (#5408)
+- **Config schema relaxation**: Relax schema to allow `installation_id` from environment variables (#5425)
+
+### Changed
+
+- **React component refs**: Migrate to `React.ComponentRef` and cleanup deprecated ref patterns (#5435)
+
+### Security
+
+- Security updates in build/go and sdk/go modules (#5438)
+
+### Dependencies
+
+- Updated various dependencies including AWS SDK, Azure SDK, Redis, OPA, gRPC Gateway, OpenTelemetry, protobuf, and UI libraries (#5478)
+
+## [2.7.0](https://github.com/flipt-io/flipt/releases/tag/v2.7.0) - 2026-02-17
+
+### Added
+
+- **SigV4 authentication for Prometheus analytics**: Support AWS SigV4 authentication for the analytics Prometheus storage backend, enabling integration with Amazon Managed Service for Prometheus (AMP) (#5388)
+
+### Fixed
+
+- **Default Git commit email**: Replace default Git commit email with a more appropriate value (#5383)
+
+### Changed
+
+- **Go 1.26**: Bumped Go version to 1.26.0 (#5386)
+- **go-git v6**: Updated go-git to v6.0.0 (#5381)
+
+### Dependencies
+
+- Updated various dependencies including OpenTelemetry, gRPC, AWS SDK, and UI libraries
+
+## [2.6.0](https://github.com/flipt-io/flipt/releases/tag/v2.6.0) - 2026-02-07
+
+### Added
+
+- **GitHub App authentication**: Support GitHub App authentication as an alternative to personal access tokens for Git SCM integration (#5327)
+- **OIDC UserInfo claims merging**: Optionally fetch and merge claims from the OIDC UserInfo endpoint into the auth session, useful for providers that keep ID token claims minimal (#5364)
+- **OIDC configurable signing algorithms**: Add `algorithms` field to OIDC provider configuration to support ID tokens signed with algorithms other than RS256 (#5362)
+
+### Fixed
+
+- **Git ref update after fetch**: Complete ref update after fetch for both bare and normal repositories, fixing issues where shallow fetches did not persist references to `refs/heads/` (#5144)
+- **License key format handling**: Fix license activation wizard to properly handle annual license key format in addition to monthly keys (#5335)
+- **GitHub auth error messages**: Improve error message when GitHub authentication fails due to organization/team security requirements (#5331)
+- **SSH URLs with non-standard ports**: Support SSH URLs with non-standard ports in Git repository configuration (#5298)
+
+### Changed
+
+- **gRPC metrics modernization**: Migrate from deprecated `go-grpc-prometheus` to `go-grpc-middleware/providers/prometheus` for gRPC metrics instrumentation (#5272)
+
+### Dependencies
+
+- Updated various dependencies including OpenTelemetry, OPA, gRPC ecosystem, ClickHouse client, and UI libraries
+
+## [2.5.0](https://github.com/flipt-io/flipt/releases/tag/v2.5.0) - 2026-01-09
+
+### Added
+
+- **Custom commit and PR templates**: Configure server-wide default templates for commit messages, PR titles, and PR bodies per storage backend (#5091)
+- **GitHub auth fallbacks**: Provide sensible fallback values for name and email when GitHub users don't have public profile information configured (#5154)
+- **SSH remote URL normalization**: Automatically normalize HTTPS URLs to SCP-style format when SSH credentials are provided, ensuring Git operations work correctly (#5130)
+
+### Fixed
+
+- **OIDC secret resolution**: Resolve secret references (`${secret:file:...}`) in OIDC provider configuration for `client_id` and `client_secret` fields (#5153)
+
+### Dependencies
+
+- Updated various dependencies including OpenTelemetry, OPA, gRPC ecosystem, Redis client, and UI libraries
+
+## [2.4.0](https://github.com/flipt-io/flipt/releases/tag/v2.4.0) - 2025-11-20
+
+### Added
+
+- **OpenTelemetry modernization**: Migrate from deprecated gRPC interceptors to modern stats handler API for improved tracing instrumentation (#4895)
+
+### Fixed
+
+- **Git remote synchronization**: Automatically sync git remote URLs with Flipt configuration to ensure repository connections stay current (#4975)
+- **Git connection error handling**: Properly detect and handle DNS resolution errors and I/O timeouts when checking git repository connections, allowing lenient fetch policy to work correctly when remotes are temporarily unreachable (#4965)
+- **Distributed tracing coverage**: Apply OpenTelemetry stats handler to both the main gRPC server and in-process channel for complete tracing coverage (#4971)
+- **UI form submission**: Enable namespace form submit button based on form validation state for better user experience (#4991)
+
+### Dependencies
+
+- Updated various dependencies including OpenTelemetry, AWS SDK, gRPC ecosystem, and UI libraries
+
+## [2.3.1](https://github.com/flipt-io/flipt/releases/tag/v2.3.1) - 2025-10-29
+
+### Fixed
+
+- **Evaluation environment lookup**: Extract duplicate environment retrieval logic with context fallback into reusable helper method for consistent environment lookup behavior (#4959)
+- **Configuration schema**: Use snake_case for fetch_policy in JSON schema to match expected configuration format (#4957)
+
+## [2.3.0](https://github.com/flipt-io/flipt/releases/tag/v2.3.0) - 2025-10-28
+
+### Added
+
+- **Configurable flag metadata in ListFlags**: New server configuration option to control whether flag metadata is included in ListFlags API responses, allowing operators to expose metadata publicly when needed (#4934, #4848)
+- **Git fetch policy configuration**: Add `fetch_policy` configuration option to control behavior when remote git fetch fails during startup, allowing Flipt to continue operating with stale local data (#4920)
+
+### Fixed
+
+- **Install script compatibility**: Prevent install script failure in minimal terminals (TERM=dumb) by adding tput capability check before setting color variables (#4928)
+- **Segment deletion validation**: Prevent deletion of segments that are referenced by flag rules or rollouts to ensure data integrity (#4879)
+- **SDK default environment compatibility**: Ensure proper compatibility with SDKs using default environment (#4857)
+- **OpenTelemetry batch evaluation**: Add missing OpenTelemetry event tracking to batch evaluation endpoint for consistent observability (#4875)
+- **UI form submission**: Prevent Enter key from submitting form when adding tags in constraint values, now properly adds tag instead (#4896)
+- **Redis configuration schema**: Set default Redis mode to "single" instead of empty string for more explicit configuration (#4926)
+- **OpenAPI generation**: Generate OpenAPI specs for v2 API using gnostic (#4847)
+
+### Changed
+
+- **Authentication error handling**: Improve code style and error handling in authentication method utilities (#4775)
+- **GitHub API**: Update to go-github/v75 for latest GitHub API features (#4866)
+- **Contributor workflow**: Optimize contributor workflow to use check_suite pattern (#4819)
+- **OpenTelemetry dependencies**: Group OpenTelemetry dependency updates for better management (#4820)
+
+### Dependencies
+
+- Updated various dependencies including OpenTelemetry group, grpc-ecosystem middleware, ClickHouse client, OPA, and cloud storage libraries
+
+## [2.2.0](https://github.com/flipt-io/flipt/releases/tag/v2.2.0) - 2025-10-02
+
+### Added
+
+- **CLI license management**: New `flipt license` command with interactive TUI wizard for managing Flipt Pro licenses (#4767)
+- **Boolean evaluation**: Include segments in boolean flag evaluation response for consistency (#4767)
+
+### Fixed
+
+- **UI environment sync**: Refetch environments when window regains focus or network reconnects to ensure UI stays in sync (#4774)
+- **Git branch cleanup**: Remove deleted branches from UI when synced from Git repositories (#4770)
+- **Docker build**: Correct ARG declaration placement in Dockerfile to resolve build issues (#4772)
+- **OpenTelemetry compatibility**: Resolve schema URL conflicts and update to compatible exporter versions
+
+### Changed
+
+- **OpenTelemetry conventions**: Align event and attribute names with OpenTelemetry semantic conventions specification (#4769)
+
+### Dependencies
+
+- Updated various UI dependencies including @mui/material, @mui/x-charts, and development tools
+
+## [2.1.3](https://github.com/flipt-io/flipt/releases/tag/v2.1.3) - 2025-09-24
+
+### Fixed
+
+- **Analytics batch processing**: Return all batch data for requested flags to prevent incomplete analytics results (#4756)
+- **Memory optimization**: Reduce memory usage with OpenTelemetry and ClickHouse integrations (#4755)
+- **Authentication middleware**: Pass correct server parameter to skipped() method in EmailMatchingUnaryInterceptor
+- **Nightly builds**: Use static v2-nightly version for consistent nightly build versioning
+
+### Changed
+
+- **Documentation**: Added nightly build Docker instructions to README for improved developer experience
+
+## [2.1.2](https://github.com/flipt-io/flipt/releases/tag/v2.1.2) - 2025-09-20
+
+### Fixed
+
+- **Segment validation**: Validate segment references exist when creating flags via v2 API to prevent snapshot creation errors and inconsistent state (#4749)
+- **OFREP authentication**: Allow authentication to be excluded for OFREP endpoints when configured (#4753)
+
+### Changed
+
+- **Developer setup**: Improved devenv setup and fixed UI styles loading issue in development mode (#4750)
+
+### Dependencies
+
+- Updated various dependencies including gqlgen, gnostic, and golang.org/x/exp
+
+## [2.1.1](https://github.com/flipt-io/flipt/releases/tag/v2.1.1) - 2025-09-13
+
+### Fixed
+
+- **Authentication middleware**: Replace panic with proper error handling in EmailMatchingUnaryInterceptor when authentication not found in context (#4744)
+- **Streaming evaluation**: Get environment key from streaming subscribe request (#4733)
+- **HTTP/2 streaming**: Accept HTTP/2 connections for streaming evaluation (#4715)
+- **Environment context**: Return error from GetFromContext when environment not found (#4745)
+
+### Changed
+
+- **Go version**: Remove toolchain in go.mod files and set Go directives to 1.25 (#4746)
+
+### Dependencies
+
+- Security update for Vite to v6.3.6 (#4721)
+- Updated various dependencies including go-bitbucket, go-jose, go-billy, and bubbletea
+
+## [2.1.0](https://github.com/flipt-io/flipt/releases/tag/v2.1.0) - 2025-09-04
+
+### Added
+
+- **Quickstart TUI**: New terminal user interface for the quickstart command using Bubbletea framework (#4639)
+- **Flipt Pro trial banner**: Added promotional banner in UI for OSS users to discover Pro features and start 14-day trial (#4660)
+- **Git repository initialization support**: Automatic detection and initialization for existing features files when using local storage backend (#4674)
+- **YAML file extension support**: Added support for `.yml` extension for features files in addition to `.yaml` (#4681)
+
+### Fixed
+
+- **Zero value serialization**: Fixed validation errors when using rollout value of 0 in variant flag distributions and percentage value of 0 in boolean flag threshold rollouts (#4678)
+- **Namespace deletion**: Handle empty directories correctly during namespace deletion (#4622)
+
+### Changed
+
+- **Default namespace display**: Always show default namespace first in namespace table (#4667)
+- **UI component organization**: Consolidated UI components into main components directory for better structure (#4661)
+- **Bitbucket SCM support**: Added Bitbucket to supported SCM providers schema (#4666)
+
+### Dependencies
+
+- Bumped various UI dependencies including `@uiw/codemirror-theme-tokyo-night`, `@tanstack/react-table`, and `lucide-react`
+- Updated `github.com/clickhouse/clickhouse-go/v2` and `github.com/go-chi/chi/v5`
+
+## [2.0.2](https://github.com/flipt-io/flipt/releases/tag/v2.0.2) - 2025-08-27
+
+### Fixed
+
+- Comprehensive Keygen API rate limit handling improvements including caching, proper error type handling, and intelligent rate limit management (#4602)
+- Process Go files in batches for `mage go:fmt` command to avoid "argument list too long" errors (#4570)
+
+### Changed
+
+- Replaced Dependabot with Renovate for dependency management (#4594, #4603)
+- Added AI-powered release notes generation for Homebrew releases (#4604)
+
+### Dependencies
+
+- Bumped React and @types/react in UI (#4582)
+- Bumped gitlab.com/gitlab-org/api/client-go from 0.129.0 to 0.139.2 (#4575)
+- Bumped @uiw/react-codemirror from 4.24.2 to 4.25.1 in UI (#4580)
+- Bumped @radix-ui/react-popover from 1.1.14 to 1.1.15 in UI (#4581)
+- Bumped @radix-ui/react-select from 2.2.5 to 2.2.6 in UI (#4579)
+- Bumped @radix-ui/react-switch from 1.2.5 to 1.2.6 in UI (#4577)
+- Bumped github.com/go-chi/cors from 1.2.1 to 1.2.2 (#4573)
+- Bumped github.com/hashicorp/go-retryablehttp (#4572)
+- Bumped @playwright/test from 1.54.1 to 1.54.2 in UI (#4578)
+- Bumped eslint-plugin-prettier from 5.2.3 to 5.5.4 in UI (#4526)
+- Bumped actions/checkout from 4 to 5 in GitHub Actions (#4576)
+
+## [2.0.1](https://github.com/flipt-io/flipt/releases/tag/v2.0.1) - 2025-08-16
+
+### Added
+
+- Include `type` and `enabled` flag attributes for v1 ListFlags API call (#4562)
+
+### Fixed
+
+- Add `x-flipt-accept-server-version` to default CORS allowed headers (#4564)
+- Correct architecture naming in v2 install script for x86_64 systems (#4555)
+- Install script no longer incorrectly installs beta versions (#4553)
+
+### Changed
+
+- Refactored CSRF handling to use Go 1.25 CSRF handler (#4561)
+- Upgraded Go from 1.24 to 1.25 (#4558)
+
+### Dependencies
+
+- Bumped TypeScript from 5.8.3 to 5.9.2 in UI (#4549)
+- Bumped @uiw/react-codemirror from 4.23.8 to 4.24.2 in UI (#4548)
+- Bumped lucide-react from 0.534.0 to 0.539.0 in UI (#4547)
+
+## [2.0.0](https://github.com/flipt-io/flipt/releases/tag/v2.0.0) - 2025-08-12
+
+Flipt v2 is a complete re-architecture of Flipt, focused on Git-native operations and multi-environment support. This major release represents a fundamental shift in how Flipt manages feature flags, bringing enterprise-grade GitOps workflows to feature management.
+
+### Added
+
+#### Core Features
+
+- **Git-Native Architecture**: Feature flags are now stored directly in Git repositories with full read/write capabilities through the API and UI
+- **Multi-Environment Support**: Manage feature flags across multiple environments using:
+  - Different Git repositories per environment
+  - Different directories within the same repository
+  - Different branches within the same repository
+- **Environment Branching**: Create isolated branches of any environment for testing changes without affecting production
+- **Git SCM Integration** (Pro): Native integration with GitHub, GitLab, BitBucket, Azure DevOps, and Gitea for merge proposals and GPG-signed commits
+- **Offline Mode**: Continue serving flags even when the source Git repository is temporarily unavailable
+
+#### Security & Secrets Management
+
+- **Secret References in Configuration**: Support for referencing secrets from environment variables and files using `{{ secret "key" }}` syntax
+- **Integrated Secrets Management**: Built-in secure storage for GPG keys with HashiCorp Vault integration (Pro) and file system support (OSS)
+- **GPG Commit Signing** (Pro): Sign all Git commits for maximum security and auditability
+- **JWT Claims Mapping**: Configurable mapping of JWT claims to well-known authentication metadata
+
+#### UI & Developer Experience
+
+- **Redesigned UI**: Complete UI overhaul for improved user experience and intuitive navigation
+- **Environment Switcher**: Seamless switching between environments in the UI
+- **Merge Proposals**: Create pull/merge requests directly from the UI (Pro)
+
+### Changed
+
+- **Storage Backend**: Default storage is now Git-based (memory or disk) rather than database-backed
+- **Configuration Format**: New configuration structure to support environments and Git storage options
+- **API Versioning**: New v2 APIs for environments, analytics, and evaluation while maintaining v1 compatibility
+- **License Model**: Introduction of Pro tier with enterprise features while maintaining OSS core

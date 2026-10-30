@@ -1,0 +1,420 @@
+package gitlab
+
+import (
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	gitlab "gitlab.com/gitlab-org/api/client-go"
+	"go.flipt.io/flipt/internal/config"
+	"go.flipt.io/flipt/internal/coss/storage/environments/git"
+	"go.flipt.io/flipt/internal/credentials"
+	serverenvsmock "go.flipt.io/flipt/internal/server/environments"
+	rpcenv "go.flipt.io/flipt/rpc/v2/environments"
+	"go.uber.org/zap"
+)
+
+func TestSCM_Propose(t *testing.T) {
+	mockMR := NewMockMergeRequestsService(t)
+	scm := &SCM{
+		logger:    zap.NewNop(),
+		projectID: "owner/repo",
+		mrs:       mockMR,
+		repos:     nil,
+	}
+
+	ctx := t.Context()
+	req := git.ProposalRequest{
+		Base:  "main",
+		Head:  "feature",
+		Title: "Test MR",
+		Body:  "This is a test",
+		Draft: false,
+	}
+
+	mr := &gitlab.MergeRequest{WebURL: "http://example.com/mr", State: "opened"}
+	resp := &gitlab.Response{Response: &http.Response{Body: io.NopCloser(strings.NewReader("ok")), StatusCode: 201}}
+	mockMR.EXPECT().CreateMergeRequest("owner/repo", &gitlab.CreateMergeRequestOptions{
+		Title:        &req.Title,
+		Description:  &req.Body,
+		SourceBranch: &req.Head,
+		TargetBranch: &req.Base,
+	}).Return(mr, resp, nil)
+
+	result, err := scm.Propose(ctx, req)
+	require.NoError(t, err)
+	assert.Equal(t, "http://example.com/mr", result.Url)
+	assert.Equal(t, rpcenv.ProposalState_PROPOSAL_STATE_OPEN, result.State)
+}
+
+func TestSCM_Propose_Draft(t *testing.T) {
+	mockMR := NewMockMergeRequestsService(t)
+	scm := &SCM{
+		logger:    zap.NewNop(),
+		projectID: "owner/repo",
+		mrs:       mockMR,
+		repos:     nil,
+	}
+
+	ctx := t.Context()
+	req := git.ProposalRequest{
+		Base:  "main",
+		Head:  "feature",
+		Title: "Test MR",
+		Body:  "This is a test",
+		Draft: true,
+	}
+	draftTitle := "Draft: Test MR"
+	mr := &gitlab.MergeRequest{WebURL: "http://example.com/mr", State: "opened"}
+	resp := &gitlab.Response{Response: &http.Response{Body: io.NopCloser(strings.NewReader("ok")), StatusCode: 201}}
+	mockMR.EXPECT().CreateMergeRequest("owner/repo", &gitlab.CreateMergeRequestOptions{
+		Title:        &draftTitle,
+		Description:  &req.Body,
+		SourceBranch: &req.Head,
+		TargetBranch: &req.Base,
+	}).Return(mr, resp, nil)
+
+	result, err := scm.Propose(ctx, req)
+	require.NoError(t, err)
+	assert.Equal(t, "http://example.com/mr", result.Url)
+	assert.Equal(t, rpcenv.ProposalState_PROPOSAL_STATE_OPEN, result.State)
+}
+
+func TestSCM_Propose_Error(t *testing.T) {
+	mockMR := NewMockMergeRequestsService(t)
+	scm := &SCM{
+		logger:    zap.NewNop(),
+		projectID: "owner/repo",
+		mrs:       mockMR,
+		repos:     nil,
+	}
+
+	ctx := t.Context()
+	req := git.ProposalRequest{}
+	mockMR.EXPECT().CreateMergeRequest("owner/repo", &gitlab.CreateMergeRequestOptions{
+		Title:        &req.Title,
+		Description:  &req.Body,
+		SourceBranch: &req.Head,
+		TargetBranch: &req.Base,
+	}).Return(nil, nil, errors.New("create error"))
+
+	result, err := scm.Propose(ctx, req)
+	require.Error(t, err)
+	assert.Nil(t, result)
+}
+
+func TestSCM_ListChanges(t *testing.T) {
+	mockRepos := NewMockRepositoriesService(t)
+	scm := &SCM{
+		logger:    zap.NewNop(),
+		projectID: "owner/repo",
+		mrs:       nil,
+		repos:     mockRepos,
+	}
+
+	ctx := t.Context()
+	req := git.ListChangesRequest{Base: "main", Head: "feature", Limit: 1}
+
+	commitTime := time.Now()
+	commit := &gitlab.Commit{
+		ID:          "sha",
+		Message:     "commit message",
+		WebURL:      "http://example.com/commit",
+		AuthorName:  "author",
+		AuthorEmail: "author@example.com",
+		CreatedAt:   &commitTime,
+	}
+	comparison := &gitlab.Compare{Commits: []*gitlab.Commit{commit}}
+	resp := &gitlab.Response{Response: &http.Response{Body: io.NopCloser(strings.NewReader("ok")), StatusCode: 200}}
+	mockRepos.EXPECT().Compare("owner/repo", &gitlab.CompareOptions{
+		From: &req.Base,
+		To:   &req.Head,
+	}).Return(comparison, resp, nil)
+
+	result, err := scm.ListChanges(ctx, req)
+	require.NoError(t, err)
+	assert.Len(t, result.Changes, 1)
+	assert.Equal(t, "sha", result.Changes[0].Revision)
+	assert.Equal(t, "commit message", result.Changes[0].Message)
+	assert.Equal(t, "author", *result.Changes[0].AuthorName)
+	assert.Equal(t, "author@example.com", *result.Changes[0].AuthorEmail)
+	assert.Equal(t, "http://example.com/commit", *result.Changes[0].ScmUrl)
+}
+
+func TestSCM_ListChanges_Error(t *testing.T) {
+	mockRepos := NewMockRepositoriesService(t)
+	scm := &SCM{
+		logger:    zap.NewNop(),
+		projectID: "owner/repo",
+		mrs:       nil,
+		repos:     mockRepos,
+	}
+
+	ctx := t.Context()
+	req := git.ListChangesRequest{Base: "main", Head: "feature"}
+	mockRepos.EXPECT().Compare("owner/repo", &gitlab.CompareOptions{
+		From: &req.Base,
+		To:   &req.Head,
+	}).Return(nil, nil, errors.New("compare error"))
+
+	result, err := scm.ListChanges(ctx, req)
+	require.Error(t, err)
+	assert.Nil(t, result)
+}
+
+func TestSCM_ListProposals(t *testing.T) {
+	mockMR := NewMockMergeRequestsService(t)
+	scm := &SCM{
+		logger:    zap.NewNop(),
+		projectID: "owner/repo",
+		mrs:       mockMR,
+		repos:     nil,
+	}
+
+	ctx := t.Context()
+	mockEnv := serverenvsmock.NewMockEnvironment(t)
+	mockEnv.EXPECT().Configuration().Return(&rpcenv.EnvironmentConfiguration{Ref: "main"})
+	mockEnv.EXPECT().Key().Return("testenv")
+
+	branch := "flipt/testenv/feature"
+	mr := &gitlab.BasicMergeRequest{
+		SourceBranch: branch,
+		WebURL:       "http://example.com/mr",
+		State:        "opened",
+	}
+	mrsList := []*gitlab.BasicMergeRequest{mr}
+	resp := &gitlab.Response{NextPage: 0}
+	mockMR.EXPECT().ListProjectMergeRequests("owner/repo", &gitlab.ListProjectMergeRequestsOptions{
+		TargetBranch: new("main"),
+		State:        new("all"),
+		PerPage:      100,
+	}).Return(mrsList, resp, nil)
+
+	result, err := scm.ListProposals(ctx, mockEnv)
+	require.NoError(t, err)
+	assert.Len(t, result, 1)
+	assert.Contains(t, result, branch)
+	assert.Equal(t, "http://example.com/mr", result[branch].Url)
+	assert.Equal(t, rpcenv.ProposalState_PROPOSAL_STATE_OPEN, result[branch].State)
+}
+
+func TestSCM_ListProposals_PrefixFilter(t *testing.T) {
+	mockMR := NewMockMergeRequestsService(t)
+	scm := &SCM{
+		logger:    zap.NewNop(),
+		projectID: "owner/repo",
+		mrs:       mockMR,
+		repos:     nil,
+	}
+
+	ctx := t.Context()
+	mockEnv := serverenvsmock.NewMockEnvironment(t)
+	mockEnv.EXPECT().Configuration().Return(&rpcenv.EnvironmentConfiguration{Ref: "main"})
+	mockEnv.EXPECT().Key().Return("testenv")
+
+	mr := &gitlab.BasicMergeRequest{
+		SourceBranch: "otherprefix/testenv/feature",
+		WebURL:       "http://example.com/mr",
+		State:        "opened",
+	}
+	mrsList := []*gitlab.BasicMergeRequest{mr}
+	resp := &gitlab.Response{NextPage: 0}
+	mockMR.EXPECT().ListProjectMergeRequests("owner/repo", &gitlab.ListProjectMergeRequestsOptions{
+		TargetBranch: new("main"),
+		State:        new("all"),
+		PerPage:      100,
+	}).Return(mrsList, resp, nil)
+
+	result, err := scm.ListProposals(ctx, mockEnv)
+	require.NoError(t, err)
+	assert.Empty(t, result)
+}
+
+func TestSCM_ListProposals_ClosedVsOpen(t *testing.T) {
+	mockMR := NewMockMergeRequestsService(t)
+	scm := &SCM{
+		logger:    zap.NewNop(),
+		projectID: "owner/repo",
+		mrs:       mockMR,
+		repos:     nil,
+	}
+
+	ctx := t.Context()
+	mockEnv := serverenvsmock.NewMockEnvironment(t)
+	mockEnv.EXPECT().Configuration().Return(&rpcenv.EnvironmentConfiguration{Ref: "main"})
+	mockEnv.EXPECT().Key().Return("testenv")
+
+	branch := "flipt/testenv/feature"
+	mrOpen := &gitlab.BasicMergeRequest{
+		SourceBranch: branch,
+		WebURL:       "http://example.com/mr-open",
+		State:        "opened",
+	}
+	mrClosed := &gitlab.BasicMergeRequest{
+		SourceBranch: branch,
+		WebURL:       "http://example.com/mr-closed",
+		State:        "closed",
+	}
+	mrsList := []*gitlab.BasicMergeRequest{mrClosed, mrOpen}
+	resp := &gitlab.Response{NextPage: 0}
+	mockMR.EXPECT().ListProjectMergeRequests("owner/repo", &gitlab.ListProjectMergeRequestsOptions{
+		TargetBranch: new("main"),
+		State:        new("all"),
+		PerPage:      100,
+	}).Return(mrsList, resp, nil)
+
+	result, err := scm.ListProposals(ctx, mockEnv)
+	require.NoError(t, err)
+	assert.Len(t, result, 1)
+	assert.Equal(t, "http://example.com/mr-open", result[branch].Url)
+	assert.Equal(t, rpcenv.ProposalState_PROPOSAL_STATE_OPEN, result[branch].State)
+}
+
+func TestSCM_ListProposals_ClosedMerged(t *testing.T) {
+	mockMR := NewMockMergeRequestsService(t)
+	scm := &SCM{
+		logger:    zap.NewNop(),
+		projectID: "owner/repo",
+		mrs:       mockMR,
+		repos:     nil,
+	}
+
+	ctx := t.Context()
+	mockEnv := serverenvsmock.NewMockEnvironment(t)
+	mockEnv.EXPECT().Configuration().Return(&rpcenv.EnvironmentConfiguration{Ref: "main"})
+	mockEnv.EXPECT().Key().Return("testenv")
+
+	branch := "flipt/testenv/feature"
+	mrClosedMerged := &gitlab.BasicMergeRequest{
+		SourceBranch: branch,
+		WebURL:       "http://example.com/mr-merged",
+		State:        "merged",
+	}
+	mrsList := []*gitlab.BasicMergeRequest{mrClosedMerged}
+	resp := &gitlab.Response{NextPage: 0}
+	mockMR.EXPECT().ListProjectMergeRequests("owner/repo", &gitlab.ListProjectMergeRequestsOptions{
+		TargetBranch: new("main"),
+		State:        new("all"),
+		PerPage:      100,
+	}).Return(mrsList, resp, nil)
+
+	result, err := scm.ListProposals(ctx, mockEnv)
+	require.NoError(t, err)
+	assert.Len(t, result, 1)
+	assert.Equal(t, "http://example.com/mr-merged", result[branch].Url)
+	assert.Equal(t, rpcenv.ProposalState_PROPOSAL_STATE_MERGED, result[branch].State)
+}
+
+func TestSCM_ListProposals_ClosedNotMerged(t *testing.T) {
+	mockMR := NewMockMergeRequestsService(t)
+	scm := &SCM{
+		logger:    zap.NewNop(),
+		projectID: "owner/repo",
+		mrs:       mockMR,
+		repos:     nil,
+	}
+
+	ctx := t.Context()
+	mockEnv := serverenvsmock.NewMockEnvironment(t)
+	mockEnv.EXPECT().Configuration().Return(&rpcenv.EnvironmentConfiguration{Ref: "main"})
+	mockEnv.EXPECT().Key().Return("testenv")
+
+	branch := "flipt/testenv/feature"
+	mrClosed := &gitlab.BasicMergeRequest{
+		SourceBranch: branch,
+		WebURL:       "http://example.com/mr-closed",
+		State:        "closed",
+	}
+	mrsList := []*gitlab.BasicMergeRequest{mrClosed}
+	resp := &gitlab.Response{NextPage: 0}
+	mockMR.EXPECT().ListProjectMergeRequests("owner/repo", &gitlab.ListProjectMergeRequestsOptions{
+		TargetBranch: new("main"),
+		State:        new("all"),
+		PerPage:      100,
+	}).Return(mrsList, resp, nil)
+
+	result, err := scm.ListProposals(ctx, mockEnv)
+	require.NoError(t, err)
+	assert.Len(t, result, 1)
+	assert.Equal(t, "http://example.com/mr-closed", result[branch].Url)
+	assert.Equal(t, rpcenv.ProposalState_PROPOSAL_STATE_CLOSED, result[branch].State)
+}
+
+func TestNewSCM_NoApiAuth(t *testing.T) {
+	scm, err := NewSCM(t.Context(), zap.NewNop(), "owner", "repo")
+	require.NoError(t, err)
+	require.NotNil(t, scm)
+	assert.Equal(t, "owner/repo", scm.projectID)
+	assert.NotNil(t, scm.mrs)
+	assert.NotNil(t, scm.repos)
+}
+
+func TestNewSCM_NoApiAuth_Propose(t *testing.T) {
+	type received struct {
+		path        string
+		privateTok  []string
+		authHeaders []string
+	}
+
+	reqs := make(chan received, 10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs <- received{
+			path:        r.URL.EscapedPath(),
+			privateTok:  r.Header.Values("PRIVATE-TOKEN"),
+			authHeaders: r.Header.Values("Authorization"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"message":"401 Unauthorized"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	apiURL, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+
+	scm, err := NewSCM(t.Context(), zap.NewNop(), "owner", "repo", WithApiURL(apiURL))
+	require.NoError(t, err)
+	require.NotNil(t, scm)
+
+	result, err := scm.Propose(t.Context(), git.ProposalRequest{
+		Base:  "main",
+		Head:  "feature",
+		Title: "Test MR",
+		Body:  "This is a test",
+	})
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), "401")
+
+	select {
+	case got := <-reqs:
+		assert.Equal(t, "/api/v4/projects/owner%2Frepo/merge_requests", got.path)
+		assert.Empty(t, got.privateTok, "unexpected PRIVATE-TOKEN header")
+		assert.Empty(t, got.authHeaders, "unexpected Authorization header")
+	default:
+		t.Fatal("api_url server received no request")
+	}
+}
+
+func TestNewSCM_UnsupportedCredentialType(t *testing.T) {
+	creds := credentials.New(zap.NewNop(), config.CredentialsConfig{
+		"ssh": {Type: config.CredentialTypeSSH, SSH: &config.SSHAuthConfig{User: "git", Password: "pass"}},
+	})
+
+	cred, err := creds.Get("ssh")
+	require.NoError(t, err)
+
+	apiAuth, err := cred.APIAuthentication()
+	require.NoError(t, err)
+
+	scm, err := NewSCM(t.Context(), zap.NewNop(), "owner", "repo", WithApiAuth(apiAuth))
+	require.EqualError(t, err, `unsupported credential type: "ssh"`)
+	assert.Nil(t, scm)
+}

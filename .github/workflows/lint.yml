@@ -1,0 +1,102 @@
+name: Lint
+on:
+  push:
+    branches:
+      - v2
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.head_ref || github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      go: ${{ steps.changes.outputs.go }}
+      ui: ${{ steps.changes.outputs.ui }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github
+      - id: changes
+        uses: ./.github/actions/changes
+
+  go-lint:
+    name: "Lint Go"
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.go != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: golangci-lint
+        run: golangci-lint run --timeout=10m
+      - name: Run gohawk
+        run: mise run go:hawk
+
+  ui-lint:
+    name: "Lint UI"
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.ui != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: Lint
+        run: |
+          npm ci
+          npm run lint
+        working-directory: ui
+
+  shellcheck:
+    name: "Shellcheck"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: "."
+          format: gcc
+          severity: warning
+          check_together: "yes"
+
+  go-mod-tidy:
+    name: "Go Mod Tidy"
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.go != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: Run go mod tidy.
+        run: go mod tidy
+
+      - name: Ensure clean git state.
+        run: git diff-index HEAD -- || (echo "Please run 'go mod tidy' and commit changes." && exit 1)
+
+  # Single required status check for this workflow, so branch protection
+  # doesn't track each lint job by name. Fails if any Go, UI, shellcheck, or
+  # go mod tidy job failed; jobs skipped by change detection pass.
+  result:
+    name: "Lint Result"
+    if: always()
+    needs: [changes, go-lint, ui-lint, shellcheck, go-mod-tidy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check job results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' > /dev/null

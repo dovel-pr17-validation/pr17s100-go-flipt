@@ -1,0 +1,273 @@
+package fs
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path"
+
+	"go.flipt.io/flipt/errors"
+	"go.flipt.io/flipt/internal/ext"
+	"go.flipt.io/flipt/rpc/flipt"
+	rpcenvironments "go.flipt.io/flipt/rpc/v2/environments"
+	"go.uber.org/zap"
+)
+
+const (
+	defaultKey = flipt.DefaultNamespace
+)
+
+var defaultNamespace = &rpcenvironments.Namespace{
+	Key:         defaultKey,
+	Name:        "default",
+	Description: new("The default namespace"),
+	Protected:   new(true),
+}
+
+type NamespaceStorage struct {
+	logger *zap.Logger
+}
+
+func NewNamespaceStorage(logger *zap.Logger) *NamespaceStorage {
+	return &NamespaceStorage{logger: logger}
+}
+
+func (s *NamespaceStorage) GetNamespace(ctx context.Context, fs Filesystem, key string) (*rpcenvironments.Namespace, error) {
+	fi, _, err := TryOpenFeaturesFile(fs, key)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if key == defaultKey {
+				return defaultNamespace, nil
+			}
+
+			return nil, errors.ErrNotFoundf("namespace %q", key)
+		}
+
+		return nil, err
+	}
+
+	defer fi.Close()
+
+	dec := ext.EncodingYAML.NewDecoder(fi)
+	for {
+		var doc ext.Document
+		if err := dec.Decode(&doc); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+
+			return nil, err
+		}
+
+		if doc.Namespace.GetKey() == key {
+			return rpcNamespaceFor(doc.Namespace), nil
+		}
+	}
+
+	return nil, errors.ErrNotFoundf("namespace %q", key)
+}
+
+func (s *NamespaceStorage) ListNamespaces(ctx context.Context, fs Filesystem) (items []*rpcenvironments.Namespace, err error) {
+	entries, err := fs.ReadDir(".")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []*rpcenvironments.Namespace{}, nil
+		}
+
+		return nil, fmt.Errorf("list namespaces: %w", err)
+	}
+
+	var defaultSeen bool
+	for _, info := range entries {
+		if !info.IsDir() {
+			continue
+		}
+
+		fi, _, err := TryOpenFeaturesFile(fs, info.Name())
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
+
+			// disregard directories without features.yaml or features.yml files
+			continue
+		}
+
+		defer fi.Close()
+
+		dec := ext.EncodingYAML.NewDecoder(fi)
+
+		for {
+			var doc ext.Document
+			if err := dec.Decode(&doc); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+
+				return nil, err
+			}
+
+			defaultSeen = defaultSeen || doc.Namespace.GetKey() == defaultKey
+
+			items = append(items, rpcNamespaceFor(doc.Namespace))
+		}
+	}
+
+	if !defaultSeen {
+		items = append([]*rpcenvironments.Namespace{defaultNamespace}, items...)
+	}
+
+	return
+}
+
+func (s *NamespaceStorage) PutNamespace(ctx context.Context, fs Filesystem, ns *rpcenvironments.Namespace) error {
+	if err := rpcenvironments.ValidateNamespaceKey(ns.Key); err != nil {
+		return err
+	}
+
+	if err := fs.MkdirAll(ns.Key, 0o755); err != nil {
+		return fmt.Errorf("creating directory %q: %w", ns.Key, err)
+	}
+
+	filename, err := FindFeaturesFilename(fs, ns.Key)
+	if err != nil {
+		return err
+	}
+	filePath := path.Join(ns.Key, filename)
+	_, err = fs.Stat(filePath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	// If the file already exists, read it to preserve existing flags and data
+	var docs []*ext.Document
+	if err == nil {
+		fi, err := fs.OpenFile(filePath, os.O_RDONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		defer fi.Close()
+
+		decoder := ext.EncodingYAML.NewDecoder(fi)
+		for {
+			doc := &ext.Document{}
+			if err := decoder.Decode(doc); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				return err
+			}
+			docs = append(docs, doc)
+		}
+	}
+
+	// Create output file
+	fi, err := fs.OpenFile(filePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer fi.Close()
+
+	// Write documents back with updated namespace info
+	encoder := ext.EncodingYAML.NewEncoder(fi)
+
+	// If we have existing documents, update the namespace in each one
+	if len(docs) > 0 {
+		for _, doc := range docs {
+			// Update namespace info if it matches the key
+			if doc.Namespace.GetKey() == ns.Key {
+				doc.Namespace = extNamespaceFor(ns)
+			}
+
+			if err := encoder.Encode(doc); err != nil {
+				return err
+			}
+		}
+	} else {
+		// No existing documents, create a new one
+		doc := NewDocumentForNS(extNamespaceFor(ns))
+		if err := encoder.Encode(doc); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *NamespaceStorage) DeleteNamespace(ctx context.Context, fs Filesystem, key string) error {
+	if key == defaultKey {
+		return errors.ErrInvalid(`namespace "default" is protected`)
+	}
+
+	if err := rpcenvironments.ValidateNamespaceKey(key); err != nil {
+		return err
+	}
+
+	filename, err := FindFeaturesFilename(fs, key)
+	if err != nil {
+		return err
+	}
+	filePath := path.Join(key, filename)
+	_, err = fs.Stat(filePath)
+	if err != nil {
+		// already removed
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
+		return err
+	}
+
+	if err := fs.Remove(filePath); err != nil {
+		return err
+	}
+
+	return err
+}
+
+func extNamespaceFor(ns *rpcenvironments.Namespace) *ext.NamespaceEmbed {
+	return &ext.NamespaceEmbed{
+		IsNamespace: &ext.Namespace{
+			Key:         ns.Key,
+			Name:        ns.Name,
+			Description: derefOrZero(ns.Description),
+		},
+	}
+}
+
+func rpcNamespaceFor(ns *ext.NamespaceEmbed) *rpcenvironments.Namespace {
+	var (
+		name        = ns.GetKey()
+		description string
+	)
+
+	if n, ok := ns.IsNamespace.(*ext.Namespace); ok {
+		if n.Name != "" {
+			name = n.Name
+		}
+		description = n.Description
+	}
+
+	return &rpcenvironments.Namespace{
+		Key:         ns.GetKey(),
+		Name:        name,
+		Description: &description,
+		Protected:   new(ns.GetKey() == defaultKey),
+	}
+}
+
+func derefOrZero[T any](t *T) (v T) {
+	if t == nil {
+		return
+	}
+
+	return *t
+}
+
+func NewDocumentForNS(ns *ext.NamespaceEmbed) *ext.Document {
+	return &ext.Document{
+		Version:   ext.LatestVersionString(),
+		Namespace: ns,
+	}
+}

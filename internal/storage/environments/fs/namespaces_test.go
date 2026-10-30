@@ -1,0 +1,455 @@
+package fs_test
+
+import (
+	"io"
+	"os"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.flipt.io/flipt/errors"
+	"go.flipt.io/flipt/internal/storage/environments/fs"
+	fstesting "go.flipt.io/flipt/internal/storage/environments/fs/testing"
+	rpcenvironments "go.flipt.io/flipt/rpc/v2/environments"
+	"go.uber.org/zap/zaptest"
+)
+
+var (
+	defaultContents = `version: "1.6"
+namespace:
+  key: default
+  name: Default
+  description: The default namespace
+`
+
+	teamAContents = `version: "1.6"
+namespace:
+  key: team_a
+  name: Team A
+  description: The Team A namespace
+`
+	filesystem = func(t *testing.T) fs.Filesystem {
+		return fstesting.NewFilesystem(
+			t,
+			fstesting.WithDirectory(
+				"default",
+				fstesting.WithFile("features.yaml", defaultContents),
+			),
+			fstesting.WithDirectory(
+				"team_a",
+				fstesting.WithFile("features.yaml", teamAContents),
+			),
+		)
+	}
+)
+
+func Test_NamespaceStorage_GetNamespace(t *testing.T) {
+	ctx := t.Context()
+	logger := zaptest.NewLogger(t)
+	storage := fs.NewNamespaceStorage(logger)
+
+	t.Run("default namespace", func(t *testing.T) {
+		ns, err := storage.GetNamespace(ctx, filesystem(t), "default")
+		require.NoError(t, err)
+
+		assert.Equal(t, &rpcenvironments.Namespace{
+			Key:         "default",
+			Name:        "Default",
+			Description: new("The default namespace"),
+			Protected:   new(true),
+		}, ns)
+	})
+
+	t.Run("team_a namespace", func(t *testing.T) {
+		ns, err := storage.GetNamespace(ctx, filesystem(t), "team_a")
+		require.NoError(t, err)
+
+		assert.Equal(t, &rpcenvironments.Namespace{
+			Key:         "team_a",
+			Name:        "Team A",
+			Description: new("The Team A namespace"),
+			Protected:   new(false),
+		}, ns)
+	})
+
+	t.Run("team_b namespace (does not exist)", func(t *testing.T) {
+		_, err := storage.GetNamespace(ctx, filesystem(t), "team_b")
+		var notfound errors.ErrNotFound
+		require.ErrorAs(t, err, &notfound)
+	})
+}
+
+func Test_NamespaceStorage_ListNamespaces(t *testing.T) {
+	ctx := t.Context()
+	logger := zaptest.NewLogger(t)
+	storage := fs.NewNamespaceStorage(logger)
+
+	items, err := storage.ListNamespaces(ctx, filesystem(t))
+	require.NoError(t, err)
+
+	assert.Equal(t, []*rpcenvironments.Namespace{
+		{
+			Key:         "default",
+			Name:        "Default",
+			Description: new("The default namespace"),
+			Protected:   new(true),
+		},
+		{
+			Key:         "team_a",
+			Name:        "Team A",
+			Description: new("The Team A namespace"),
+			Protected:   new(false),
+		},
+	}, items)
+
+	t.Run("empty sub-directory returns empty namespace list", func(t *testing.T) {
+		items, err := storage.ListNamespaces(ctx, fs.SubFilesystem(filesystem(t), "notfound"))
+		require.NoError(t, err)
+
+		assert.Equal(t, []*rpcenvironments.Namespace{}, items)
+	})
+}
+
+func Test_NamespaceStorage_PutNamespace(t *testing.T) {
+	ctx := t.Context()
+	logger := zaptest.NewLogger(t)
+	storage := fs.NewNamespaceStorage(logger)
+
+	fs := filesystem(t)
+	require.NoError(t, storage.PutNamespace(ctx, fs, &rpcenvironments.Namespace{
+		Key:         "team_b",
+		Name:        "Team B",
+		Description: new("The Team B namespace"),
+	}))
+
+	t.Run("ensure file has expected contents", func(t *testing.T) {
+		fi, err := fs.OpenFile("team_b/features.yaml", os.O_RDONLY, 0o644)
+		require.NoError(t, err)
+
+		data, err := io.ReadAll(fi)
+		require.NoError(t, err)
+
+		assert.Equal(t, `version: "1.6"
+namespace:
+  key: team_b
+  name: Team B
+  description: The Team B namespace
+`, string(data))
+
+		require.NoError(t, fi.Close())
+	})
+
+	t.Run("ensure namespace is now retrievable", func(t *testing.T) {
+		ns, err := storage.GetNamespace(ctx, fs, "team_b")
+		require.NoError(t, err)
+
+		assert.Equal(t, "team_b", ns.Key)
+	})
+
+	t.Run("updating namespace preserves flags and data", func(t *testing.T) {
+		// Create a test filesystem with namespace and flags
+		testFs := fstesting.NewFilesystem(
+			t,
+			fstesting.WithDirectory(
+				"test_ns",
+				fstesting.WithFile("features.yaml", `version: "1.5"
+namespace:
+  key: test_ns
+  name: Test Namespace
+  description: Original description
+flags:
+  - key: flag1
+    name: Flag 1
+    type: BOOLEAN
+    description: A test flag
+    enabled: true
+`),
+			),
+		)
+
+		// First verify the namespace exists with the flag
+		ns, err := storage.GetNamespace(ctx, testFs, "test_ns")
+		require.NoError(t, err)
+		assert.Equal(t, "Test Namespace", ns.Name)
+		assert.Equal(t, "Original description", *ns.Description)
+
+		// Now update the namespace metadata
+		require.NoError(t, storage.PutNamespace(ctx, testFs, &rpcenvironments.Namespace{
+			Key:         "test_ns",
+			Name:        "Updated Name",
+			Description: new("Updated description"),
+		}))
+
+		// Read the file content to make sure flags are preserved
+		fi, err := testFs.OpenFile("test_ns/features.yaml", os.O_RDONLY, 0o644)
+		require.NoError(t, err)
+		defer fi.Close()
+
+		data, err := io.ReadAll(fi)
+		require.NoError(t, err)
+
+		// Verify the content has both the updated namespace metadata and the original flag
+		assert.Contains(t, string(data), "key: test_ns")
+		assert.Contains(t, string(data), "name: Updated Name")
+		assert.Contains(t, string(data), "description: Updated description")
+		assert.Contains(t, string(data), "key: flag1")
+		assert.Contains(t, string(data), "name: Flag 1")
+		assert.Contains(t, string(data), "type: BOOLEAN")
+	})
+}
+
+func Test_NamespaceStorage_DeleteNamespace(t *testing.T) {
+	ctx := t.Context()
+	logger := zaptest.NewLogger(t)
+	storage := fs.NewNamespaceStorage(logger)
+
+	fs := filesystem(t)
+	require.NoError(t, storage.DeleteNamespace(ctx, fs, "team_a"))
+
+	t.Run("ensure namespace is not found", func(t *testing.T) {
+		_, err := storage.GetNamespace(ctx, fs, "team_a")
+		var notfound errors.ErrNotFound
+		require.ErrorAs(t, err, &notfound)
+	})
+}
+
+// Test YML extension support
+
+func Test_NamespaceStorage_YMLExtensionSupport(t *testing.T) {
+	ctx := t.Context()
+	logger := zaptest.NewLogger(t)
+	storage := fs.NewNamespaceStorage(logger)
+
+	// Test filesystem with .yml files
+	ymlFilesystem := fstesting.NewFilesystem(
+		t,
+		fstesting.WithDirectory(
+			"default",
+			fstesting.WithFile("features.yml", defaultContents),
+		),
+		fstesting.WithDirectory(
+			"team_b",
+			fstesting.WithFile("features.yml", `version: "1.5"
+namespace:
+  key: team_b
+  name: Team B
+  description: Team B with yml extension`),
+		),
+	)
+
+	t.Run("GetNamespace with .yml files", func(t *testing.T) {
+		ns, err := storage.GetNamespace(ctx, ymlFilesystem, "default")
+		require.NoError(t, err)
+
+		assert.Equal(t, &rpcenvironments.Namespace{
+			Key:         "default",
+			Name:        "Default",
+			Description: new("The default namespace"),
+			Protected:   new(true),
+		}, ns)
+
+		ns2, err := storage.GetNamespace(ctx, ymlFilesystem, "team_b")
+		require.NoError(t, err)
+
+		assert.Equal(t, &rpcenvironments.Namespace{
+			Key:         "team_b",
+			Name:        "Team B",
+			Description: new("Team B with yml extension"),
+			Protected:   new(false),
+		}, ns2)
+	})
+
+	t.Run("ListNamespaces with .yml files", func(t *testing.T) {
+		items, err := storage.ListNamespaces(ctx, ymlFilesystem)
+		require.NoError(t, err)
+
+		assert.Len(t, items, 2)
+		assert.Equal(t, "default", items[0].Key)
+		assert.Equal(t, "team_b", items[1].Key)
+	})
+
+	t.Run("PutNamespace preserves .yml extension", func(t *testing.T) {
+		// Update existing namespace with .yml file
+		require.NoError(t, storage.PutNamespace(ctx, ymlFilesystem, &rpcenvironments.Namespace{
+			Key:         "team_b",
+			Name:        "Updated Team B",
+			Description: new("Updated description"),
+		}))
+
+		// Verify file is still .yml and has updated content
+		fi, err := ymlFilesystem.OpenFile("team_b/features.yml", os.O_RDONLY, 0o644)
+		require.NoError(t, err)
+		defer fi.Close()
+
+		data, err := io.ReadAll(fi)
+		require.NoError(t, err)
+
+		assert.Contains(t, string(data), "name: Updated Team B")
+		assert.Contains(t, string(data), "description: Updated description")
+
+		// Verify .yaml file was NOT created
+		_, err = ymlFilesystem.Stat("team_b/features.yaml")
+		assert.ErrorIs(t, err, os.ErrNotExist)
+	})
+
+	t.Run("DeleteNamespace with .yml files", func(t *testing.T) {
+		require.NoError(t, storage.DeleteNamespace(ctx, ymlFilesystem, "team_b"))
+
+		// Verify namespace is gone
+		_, err := storage.GetNamespace(ctx, ymlFilesystem, "team_b")
+		var notfound errors.ErrNotFound
+		require.ErrorAs(t, err, &notfound)
+
+		// Verify .yml file is removed
+		_, err = ymlFilesystem.Stat("team_b/features.yml")
+		assert.ErrorIs(t, err, os.ErrNotExist)
+	})
+}
+
+func Test_NamespaceStorage_MixedExtensions(t *testing.T) {
+	ctx := t.Context()
+	logger := zaptest.NewLogger(t)
+	storage := fs.NewNamespaceStorage(logger)
+
+	// Test filesystem with mixed .yaml and .yml files
+	mixedFilesystem := fstesting.NewFilesystem(
+		t,
+		fstesting.WithDirectory(
+			"default",
+			fstesting.WithFile("features.yaml", defaultContents),
+		),
+		fstesting.WithDirectory(
+			"team_yaml",
+			fstesting.WithFile("features.yaml", `version: "1.5"
+namespace:
+  key: team_yaml
+  name: Team YAML
+  description: Team with yaml extension`),
+		),
+		fstesting.WithDirectory(
+			"team_yml",
+			fstesting.WithFile("features.yml", `version: "1.5"
+namespace:
+  key: team_yml
+  name: Team YML
+  description: Team with yml extension`),
+		),
+	)
+
+	t.Run("ListNamespaces with mixed extensions", func(t *testing.T) {
+		items, err := storage.ListNamespaces(ctx, mixedFilesystem)
+		require.NoError(t, err)
+
+		assert.Len(t, items, 3)
+
+		// Should find all three namespaces regardless of extension
+		keys := make([]string, len(items))
+		for i, item := range items {
+			keys[i] = item.Key
+		}
+		assert.Contains(t, keys, "default")
+		assert.Contains(t, keys, "team_yaml")
+		assert.Contains(t, keys, "team_yml")
+	})
+
+	t.Run("GetNamespace works for both extensions", func(t *testing.T) {
+		// Test .yaml file
+		ns1, err := storage.GetNamespace(ctx, mixedFilesystem, "team_yaml")
+		require.NoError(t, err)
+		assert.Equal(t, "Team YAML", ns1.Name)
+
+		// Test .yml file
+		ns2, err := storage.GetNamespace(ctx, mixedFilesystem, "team_yml")
+		require.NoError(t, err)
+		assert.Equal(t, "Team YML", ns2.Name)
+	})
+}
+
+func Test_NamespaceStorage_NewNamespaceDefaultsToYAML(t *testing.T) {
+	ctx := t.Context()
+	logger := zaptest.NewLogger(t)
+	storage := fs.NewNamespaceStorage(logger)
+
+	// Empty filesystem
+	emptyFs := fstesting.NewFilesystem(t)
+
+	t.Run("new namespace creates .yaml file", func(t *testing.T) {
+		require.NoError(t, storage.PutNamespace(ctx, emptyFs, &rpcenvironments.Namespace{
+			Key:         "new_team",
+			Name:        "New Team",
+			Description: new("New team namespace"),
+		}))
+
+		// Verify .yaml file was created (not .yml)
+		fi, err := emptyFs.OpenFile("new_team/features.yaml", os.O_RDONLY, 0o644)
+		require.NoError(t, err)
+		defer fi.Close()
+
+		data, err := io.ReadAll(fi)
+		require.NoError(t, err)
+
+		assert.Contains(t, string(data), "key: new_team")
+		assert.Contains(t, string(data), "name: New Team")
+
+		// Verify .yml file was NOT created
+		_, err = emptyFs.Stat("new_team/features.yml")
+		assert.ErrorIs(t, err, os.ErrNotExist)
+	})
+}
+
+func Test_NamespaceStorage_RejectsUnsafeKeys(t *testing.T) {
+	ctx := t.Context()
+	storage := fs.NewNamespaceStorage(zaptest.NewLogger(t))
+
+	for _, key := range []string{"a/b", "../team_a", ".git", "."} {
+		t.Run(key, func(t *testing.T) {
+			filesystem := filesystem(t)
+
+			var invalid errors.ErrInvalid
+			err := storage.PutNamespace(ctx, filesystem, &rpcenvironments.Namespace{Key: key, Name: key})
+			require.ErrorAs(t, err, &invalid)
+
+			err = storage.DeleteNamespace(ctx, filesystem, key)
+			require.ErrorAs(t, err, &invalid)
+
+			// nothing was created or removed
+			namespaces, err := storage.ListNamespaces(ctx, filesystem)
+			require.NoError(t, err)
+			keys := make([]string, 0, len(namespaces))
+			for _, ns := range namespaces {
+				keys = append(keys, ns.Key)
+			}
+			assert.ElementsMatch(t, []string{"default", "team_a"}, keys)
+		})
+	}
+}
+
+func Test_NamespaceStorage_ExistingKeyCanBeCleanedUp(t *testing.T) {
+	// Namespaces created before keys were validated can still be read,
+	// updated and deleted, even though new namespaces cannot use such keys.
+	ctx := t.Context()
+	storage := fs.NewNamespaceStorage(zaptest.NewLogger(t))
+	filesystem := fstesting.NewFilesystem(
+		t,
+		fstesting.WithDirectory("default", fstesting.WithFile("features.yaml", defaultContents)),
+		fstesting.WithDirectory("my.namespace", fstesting.WithFile("features.yaml", `version: "1.6"
+namespace:
+  key: my.namespace
+  name: My Namespace
+`)),
+	)
+
+	ns, err := storage.GetNamespace(ctx, filesystem, "my.namespace")
+	require.NoError(t, err)
+	assert.Equal(t, "My Namespace", ns.Name)
+
+	require.NoError(t, storage.PutNamespace(ctx, filesystem, &rpcenvironments.Namespace{Key: "my.namespace", Name: "Renamed"}))
+	ns, err = storage.GetNamespace(ctx, filesystem, "my.namespace")
+	require.NoError(t, err)
+	assert.Equal(t, "Renamed", ns.Name)
+
+	require.NoError(t, storage.DeleteNamespace(ctx, filesystem, "my.namespace"))
+	_, err = storage.GetNamespace(ctx, filesystem, "my.namespace")
+	var notFound errors.ErrNotFound
+	require.ErrorAs(t, err, &notFound)
+}

@@ -1,0 +1,10 @@
+authentication:
+  required: true
+  methods:
+    token:
+      enabled: true
+      storage:
+        type: static
+        tokens:
+          bootstrap:
+            credential: "s3cr3t!"

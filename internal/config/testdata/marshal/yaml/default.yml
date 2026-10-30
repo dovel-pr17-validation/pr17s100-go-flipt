@@ -1,0 +1,37 @@
+log:
+  level: INFO
+  encoding: console
+  grpc_level: ERROR
+
+ui:
+  enabled: true
+  default_theme: system
+
+server:
+  host: 0.0.0.0
+  http_port: 8080
+  https_port: 443
+  grpc_port: 9000
+  http_read_timeout: 10s
+  protocol: http
+
+environments:
+  default:
+    default: true
+    name: default
+    storage: default
+
+storage:
+  default:
+    backend:
+      type: memory
+    branch: main
+    poll_interval: 30s
+
+metrics:
+  enabled: true
+  exporter: prometheus
+
+meta:
+  check_for_updates: true
+  telemetry_enabled: true

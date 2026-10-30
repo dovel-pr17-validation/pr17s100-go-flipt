@@ -1,0 +1,6 @@
+storage:
+  default:
+    remote: "git@github.com:foo/bar.git"
+    backend:
+      type: "local"
+      path: "/path/to/gitdir"

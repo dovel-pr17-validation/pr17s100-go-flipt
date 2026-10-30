@@ -1,0 +1,1227 @@
+package grpc_middleware
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	cctx "go.flipt.io/flipt/internal/common"
+	"go.flipt.io/flipt/internal/server/analytics"
+	authmiddlewaregrpc "go.flipt.io/flipt/internal/server/authn/middleware/grpc"
+	"go.flipt.io/flipt/internal/server/authz"
+	servercommon "go.flipt.io/flipt/internal/server/common"
+	middlewaregrpc "go.flipt.io/flipt/internal/server/middleware/grpc"
+	"go.flipt.io/flipt/rpc/flipt"
+	authrpc "go.flipt.io/flipt/rpc/flipt/auth"
+	rpcevaluation "go.flipt.io/flipt/rpc/flipt/evaluation"
+	"go.flipt.io/flipt/rpc/flipt/ofrep"
+	rpcanalytics "go.flipt.io/flipt/rpc/v2/analytics"
+	"go.flipt.io/flipt/rpc/v2/environments"
+	rpcevaluationv2 "go.flipt.io/flipt/rpc/v2/evaluation"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/emptypb"
+)
+
+type mockPolicyVerifier struct {
+	isAllowed                        bool
+	wantErr                          error
+	input                            map[string]any
+	viewableEnvironments             []string
+	viewableEnvironmentsErr          error
+	viewableNamespacesForEnvironment map[string][]string
+	viewableNamespacesErr            error
+}
+
+func (v *mockPolicyVerifier) IsAllowed(ctx context.Context, input map[string]any) (bool, error) {
+	v.input = input
+	return v.isAllowed, v.wantErr
+}
+
+func (v *mockPolicyVerifier) ViewableEnvironments(_ context.Context, _ map[string]any) ([]string, error) {
+	return v.viewableEnvironments, v.viewableEnvironmentsErr
+}
+
+func (v *mockPolicyVerifier) ViewableNamespaces(_ context.Context, env string, _ map[string]any) ([]string, error) {
+	return v.viewableNamespacesForEnvironment[env], v.viewableNamespacesErr
+}
+
+func (v *mockPolicyVerifier) Shutdown(_ context.Context) error {
+	return nil
+}
+
+// mockServer is used to test skipping authz
+type mockServer struct {
+	skipsAuthz bool
+}
+
+// nilEnvironmentRequester returns a request with a nil environment to exercise
+// the defensive deny guard in the ListNamespaces authorization path.
+type nilEnvironmentRequester struct{}
+
+func (nilEnvironmentRequester) Request() []flipt.Request {
+	return []flipt.Request{
+		{
+			Scope:  flipt.ScopeEnvironment,
+			Action: flipt.ActionRead,
+		},
+	}
+}
+
+func (s *mockServer) SkipsAuthorization(ctx context.Context) bool {
+	return s.skipsAuthz
+}
+
+var adminAuth = &authrpc.Authentication{
+	Metadata: map[string]string{
+		"io.flipt.auth.role": "admin",
+	},
+}
+
+func TestAuthorizationActionForCreateAndUpdateMethods(t *testing.T) {
+	tests := []struct {
+		name       string
+		fullMethod string
+		req        flipt.Requester
+		want       flipt.Request
+	}{
+		{
+			name:       "create namespace",
+			fullMethod: environments.EnvironmentsService_CreateNamespace_FullMethodName,
+			req:        &environments.UpdateNamespaceRequest{EnvironmentKey: "default", Key: "namespace"},
+			want:       flipt.NewRequest(flipt.ScopeEnvironment, flipt.ActionCreate, flipt.WithEnvironment("default"), flipt.WithNamespace("namespace")),
+		},
+		{
+			name:       "update namespace",
+			fullMethod: environments.EnvironmentsService_UpdateNamespace_FullMethodName,
+			req:        &environments.UpdateNamespaceRequest{EnvironmentKey: "default", Key: "namespace"},
+			want:       flipt.NewRequest(flipt.ScopeEnvironment, flipt.ActionUpdate, flipt.WithEnvironment("default"), flipt.WithNamespace("namespace")),
+		},
+		{
+			name:       "create resource",
+			fullMethod: environments.EnvironmentsService_CreateResource_FullMethodName,
+			req:        &environments.UpdateResourceRequest{EnvironmentKey: "default", NamespaceKey: "namespace"},
+			want:       flipt.NewRequest(flipt.ScopeNamespace, flipt.ActionCreate, flipt.WithEnvironment("default"), flipt.WithNamespace("namespace")),
+		},
+		{
+			name:       "branch environment",
+			fullMethod: environments.EnvironmentsService_BranchEnvironment_FullMethodName,
+			req:        &environments.BranchEnvironmentRequest{EnvironmentKey: "default", Key: "branch"},
+			want:       flipt.NewRequest(flipt.ScopeEnvironment, flipt.ActionCreate, flipt.WithEnvironment("default")),
+		},
+		{
+			name:       "delete branch environment",
+			fullMethod: environments.EnvironmentsService_DeleteBranchEnvironment_FullMethodName,
+			req:        &environments.DeleteBranchEnvironmentRequest{EnvironmentKey: "default", Key: "branch"},
+			want:       flipt.NewRequest(flipt.ScopeEnvironment, flipt.ActionDelete, flipt.WithEnvironment("default")),
+		},
+		{
+			name:       "propose environment",
+			fullMethod: environments.EnvironmentsService_ProposeEnvironment_FullMethodName,
+			req:        &environments.ProposeEnvironmentRequest{EnvironmentKey: "default", Key: "branch"},
+			want:       flipt.NewRequest(flipt.ScopeEnvironment, flipt.ActionCreate, flipt.WithEnvironment("default")),
+		},
+		{
+			name:       "update resource",
+			fullMethod: environments.EnvironmentsService_UpdateResource_FullMethodName,
+			req:        &environments.UpdateResourceRequest{EnvironmentKey: "default", NamespaceKey: "namespace"},
+			want:       flipt.NewRequest(flipt.ScopeNamespace, flipt.ActionUpdate, flipt.WithEnvironment("default"), flipt.WithNamespace("namespace")),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policyVerifier := &mockPolicyVerifier{isAllowed: true}
+			ctx := authmiddlewaregrpc.ContextWithAuthentication(t.Context(), adminAuth)
+			info := &grpc.UnaryServerInfo{Server: &mockServer{}, FullMethod: tt.fullMethod}
+
+			_, err := AuthorizationRequiredInterceptor(zap.NewNop(), policyVerifier)(ctx, tt.req, info, func(context.Context, any) (any, error) {
+				return nil, nil
+			})
+
+			require.NoError(t, err)
+			assert.Equal(t, authz.RequestInput(tt.want), policyVerifier.input["request"])
+		})
+	}
+}
+
+func TestReadOnlyPrincipalsCannotMutateBranches(t *testing.T) {
+	tests := []struct {
+		name       string
+		fullMethod string
+		req        flipt.Requester
+		action     flipt.Action
+	}{
+		{
+			name:       "create branch",
+			fullMethod: environments.EnvironmentsService_BranchEnvironment_FullMethodName,
+			req:        &environments.BranchEnvironmentRequest{EnvironmentKey: "default", Key: "feature"},
+			action:     flipt.ActionCreate,
+		},
+		{
+			name:       "delete branch",
+			fullMethod: environments.EnvironmentsService_DeleteBranchEnvironment_FullMethodName,
+			req:        &environments.DeleteBranchEnvironmentRequest{EnvironmentKey: "default", Key: "feature"},
+			action:     flipt.ActionDelete,
+		},
+		{
+			name:       "propose branch",
+			fullMethod: environments.EnvironmentsService_ProposeEnvironment_FullMethodName,
+			req:        &environments.ProposeEnvironmentRequest{EnvironmentKey: "default", Key: "feature"},
+			action:     flipt.ActionCreate,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.action, tt.req.Request()[0].Action)
+
+			called := false
+			ctx := authmiddlewaregrpc.ContextWithAuthentication(t.Context(), adminAuth)
+			info := &grpc.UnaryServerInfo{Server: &mockServer{}, FullMethod: tt.fullMethod}
+			_, err := AuthorizationRequiredInterceptor(zap.NewNop(), &mockPolicyVerifier{})(ctx, tt.req, info, func(context.Context, any) (any, error) {
+				called = true
+				return nil, nil
+			})
+
+			require.Error(t, err)
+			assert.False(t, called)
+		})
+	}
+}
+
+func TestAuthorizationRequiredInterceptorListScopesFailClosed(t *testing.T) {
+	tests := []struct {
+		name                    string
+		fullMethod              string
+		req                     flipt.Requester
+		viewable                []string
+		viewableErr             error
+		viewableEnvironments    []string
+		viewableEnvironmentsErr error
+		wantScopeKey            any
+		wantScopeValue          []string
+		validatorAllowed        bool
+		wantHandlerCalled       bool
+		wantError               bool
+	}{
+		{
+			name:              "partial environments remain visible",
+			fullMethod:        environments.EnvironmentsService_ListEnvironments_FullMethodName,
+			req:               &environments.ListEnvironmentsRequest{},
+			viewable:          []string{"staging"},
+			wantScopeKey:      authz.EnvironmentsKey,
+			wantScopeValue:    []string{"staging"},
+			wantHandlerCalled: true,
+		},
+		{
+			name:              "undefined environments scope denied without allow",
+			fullMethod:        environments.EnvironmentsService_ListEnvironments_FullMethodName,
+			req:               &environments.ListEnvironmentsRequest{},
+			wantError:         true,
+			wantHandlerCalled: false,
+		},
+		{
+			name:              "undefined environments scope allowed with allow",
+			fullMethod:        environments.EnvironmentsService_ListEnvironments_FullMethodName,
+			req:               &environments.ListEnvironmentsRequest{},
+			validatorAllowed:  true,
+			wantScopeKey:      authz.EnvironmentsKey,
+			wantScopeValue:    []string{"*"},
+			wantHandlerCalled: true,
+		},
+		{
+			name:              "empty environments are not unrestricted",
+			fullMethod:        environments.EnvironmentsService_ListEnvironments_FullMethodName,
+			req:               &environments.ListEnvironmentsRequest{},
+			viewable:          []string{},
+			validatorAllowed:  true,
+			wantScopeKey:      authz.EnvironmentsKey,
+			wantScopeValue:    []string{},
+			wantHandlerCalled: true,
+		},
+		{
+			name:              "wildcard environments remain visible",
+			fullMethod:        environments.EnvironmentsService_ListEnvironments_FullMethodName,
+			req:               &environments.ListEnvironmentsRequest{},
+			viewable:          []string{"*"},
+			wantScopeKey:      authz.EnvironmentsKey,
+			wantScopeValue:    []string{"*"},
+			wantHandlerCalled: true,
+		},
+		{
+			name:        "environment query failure denies",
+			fullMethod:  environments.EnvironmentsService_ListEnvironments_FullMethodName,
+			req:         &environments.ListEnvironmentsRequest{},
+			viewableErr: errors.New("query failed"),
+			wantError:   true,
+		},
+		{
+			name:              "partial namespaces remain visible",
+			fullMethod:        environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:               &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			viewable:          []string{"analytics"},
+			wantScopeKey:      authz.NamespacesKey,
+			wantScopeValue:    []string{"analytics"},
+			wantHandlerCalled: true,
+		},
+		{
+			name:              "undefined namespaces scope denied without allow",
+			fullMethod:        environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:               &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			wantError:         true,
+			wantHandlerCalled: false,
+		},
+		{
+			name:              "undefined namespaces scope allowed with allow",
+			fullMethod:        environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:               &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			validatorAllowed:  true,
+			wantScopeKey:      authz.NamespacesKey,
+			wantScopeValue:    []string{"*"},
+			wantHandlerCalled: true,
+		},
+		{
+			name:                 "undefined namespaces scope denied despite visible environment",
+			fullMethod:           environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:                  &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			viewableEnvironments: []string{"production"},
+			wantError:            true,
+			wantHandlerCalled:    false,
+		},
+		{
+			name:                 "undefined namespaces scope allowed in visible environment with allow",
+			fullMethod:           environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:                  &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			viewableEnvironments: []string{"production"},
+			validatorAllowed:     true,
+			wantScopeKey:         authz.NamespacesKey,
+			wantScopeValue:       []string{"*"},
+			wantHandlerCalled:    true,
+		},
+		{
+			name:                 "namespaces in hidden environment denied",
+			fullMethod:           environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:                  &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			viewable:             []string{"*"},
+			viewableEnvironments: []string{"staging"},
+			wantError:            true,
+			wantHandlerCalled:    false,
+		},
+		{
+			name:                 "namespaces in hidden environment denied despite namespace scope",
+			fullMethod:           environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:                  &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			viewable:             []string{"analytics"},
+			viewableEnvironments: []string{"staging"},
+			wantError:            true,
+			wantHandlerCalled:    false,
+		},
+		{
+			name:                 "namespaces in visible environment allowed",
+			fullMethod:           environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:                  &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			viewable:             []string{"analytics"},
+			viewableEnvironments: []string{"production"},
+			wantScopeKey:         authz.NamespacesKey,
+			wantScopeValue:       []string{"analytics"},
+			wantHandlerCalled:    true,
+		},
+		{
+			name:                 "namespaces with wildcard environments allowed",
+			fullMethod:           environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:                  &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			viewable:             []string{"analytics"},
+			viewableEnvironments: []string{"*"},
+			wantScopeKey:         authz.NamespacesKey,
+			wantScopeValue:       []string{"analytics"},
+			wantHandlerCalled:    true,
+		},
+		{
+			name:                 "namespaces with empty environments scope denied",
+			fullMethod:           environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:                  &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			viewable:             []string{"analytics"},
+			viewableEnvironments: []string{},
+			wantError:            true,
+			wantHandlerCalled:    false,
+		},
+		{
+			name:              "empty namespaces are not unrestricted",
+			fullMethod:        environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:               &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			viewable:          []string{},
+			wantScopeKey:      authz.NamespacesKey,
+			wantScopeValue:    []string{},
+			wantHandlerCalled: true,
+		},
+		{
+			name:              "wildcard namespaces remain visible",
+			fullMethod:        environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:               &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			viewable:          []string{"*"},
+			wantScopeKey:      authz.NamespacesKey,
+			wantScopeValue:    []string{"*"},
+			wantHandlerCalled: true,
+		},
+		{
+			name:              "namespace query failure denies",
+			fullMethod:        environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:               &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			viewableErr:       errors.New("query failed"),
+			wantError:         true,
+			wantHandlerCalled: false,
+		},
+		{
+			name:                    "environment scope query failure denies namespaces",
+			fullMethod:              environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:                     &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			viewable:                []string{"analytics"},
+			viewableEnvironmentsErr: errors.New("query failed"),
+			wantError:               true,
+			wantHandlerCalled:       false,
+		},
+		{
+			name:                    "environment scope query failure denies namespaces despite allow",
+			fullMethod:              environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:                     &environments.ListNamespacesRequest{EnvironmentKey: "production"},
+			viewable:                []string{"analytics"},
+			viewableEnvironmentsErr: errors.New("query failed"),
+			validatorAllowed:        true,
+			wantError:               true,
+			wantHandlerCalled:       false,
+		},
+		{
+			name:              "nil environment denied without panic",
+			fullMethod:        environments.EnvironmentsService_ListNamespaces_FullMethodName,
+			req:               nilEnvironmentRequester{},
+			wantError:         true,
+			wantHandlerCalled: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var handlerContext context.Context
+			ctx := authmiddlewaregrpc.ContextWithAuthentication(t.Context(), adminAuth)
+			info := &grpc.UnaryServerInfo{Server: &mockServer{}, FullMethod: tt.fullMethod}
+			verifier := &mockPolicyVerifier{isAllowed: tt.validatorAllowed}
+			if tt.fullMethod == environments.EnvironmentsService_ListEnvironments_FullMethodName {
+				verifier.viewableEnvironments = tt.viewable
+				verifier.viewableEnvironmentsErr = tt.viewableErr
+			} else {
+				verifier.viewableEnvironments = tt.viewableEnvironments
+				verifier.viewableEnvironmentsErr = tt.viewableEnvironmentsErr
+				verifier.viewableNamespacesForEnvironment = map[string][]string{"production": tt.viewable}
+				verifier.viewableNamespacesErr = tt.viewableErr
+			}
+
+			called := false
+			_, err := AuthorizationRequiredInterceptor(zap.NewNop(), verifier)(ctx, tt.req, info, func(ctx context.Context, _ any) (any, error) {
+				called = true
+				handlerContext = ctx
+				return nil, nil
+			})
+
+			assert.Equal(t, tt.wantHandlerCalled, called)
+			assert.Equal(t, tt.wantError, err != nil)
+			if !tt.wantHandlerCalled {
+				return
+			}
+			require.NotNil(t, handlerContext)
+			assert.True(t, authz.IsAuthorizationRequired(handlerContext))
+			assert.ElementsMatch(t, tt.wantScopeValue, handlerContext.Value(tt.wantScopeKey).([]string))
+		})
+	}
+}
+
+func TestAuthorizationRequiredInterceptor_EvaluationRequests(t *testing.T) {
+	tests := []struct {
+		name string
+		ctx  func(context.Context) context.Context
+		req  any
+		want []map[string]any
+	}{
+		{
+			name: "evaluation request",
+			ctx:  func(ctx context.Context) context.Context { return ctx },
+			req: &rpcevaluation.EvaluationRequest{
+				EnvironmentKey: "production",
+				NamespaceKey:   "team-a",
+			},
+			want: []map[string]any{
+				{
+					"scope":       "namespace",
+					"environment": "production",
+					"namespace":   "team-a",
+					"action":      "evaluate",
+				},
+			},
+		},
+		{
+			name: "batch evaluation requests",
+			ctx:  func(ctx context.Context) context.Context { return ctx },
+			req: &rpcevaluation.BatchEvaluationRequest{
+				Requests: []*rpcevaluation.EvaluationRequest{
+					{EnvironmentKey: "production", NamespaceKey: "team-a"},
+					{EnvironmentKey: "production", NamespaceKey: "team-b"},
+				},
+			},
+			want: []map[string]any{
+				{
+					"scope":       "namespace",
+					"environment": "production",
+					"namespace":   "team-a",
+					"action":      "evaluate",
+				},
+				{
+					"scope":       "namespace",
+					"environment": "production",
+					"namespace":   "team-b",
+					"action":      "evaluate",
+				},
+			},
+		},
+		{
+			name: "snapshot request",
+			ctx:  func(ctx context.Context) context.Context { return ctx },
+			req: &rpcevaluationv2.EvaluationNamespaceSnapshotRequest{
+				Key:            "team-a",
+				EnvironmentKey: "production",
+			},
+			want: []map[string]any{
+				{
+					"scope":       "namespace",
+					"environment": "production",
+					"namespace":   "team-a",
+					"action":      "evaluate",
+				},
+			},
+		},
+		{
+			name: "snapshot stream request",
+			ctx:  func(ctx context.Context) context.Context { return ctx },
+			req: &rpcevaluationv2.EvaluationNamespaceSnapshotStreamRequest{
+				Key:            "team-a",
+				EnvironmentKey: "production",
+			},
+			want: []map[string]any{
+				{
+					"scope":       "namespace",
+					"environment": "production",
+					"namespace":   "team-a",
+					"action":      "evaluate",
+				},
+			},
+		},
+		{
+			name: "ofrep flag request from headers",
+			ctx: func(ctx context.Context) context.Context {
+				ctx = cctx.WithFliptEnvironment(ctx, "production")
+				return cctx.WithFliptNamespace(ctx, "team-a")
+			},
+			req: &ofrep.EvaluateFlagRequest{Key: "flag"},
+			want: []map[string]any{
+				{
+					"scope":       "namespace",
+					"environment": "production",
+					"namespace":   "team-a",
+					"action":      "evaluate",
+				},
+			},
+		},
+		{
+			name: "ofrep bulk request defaults",
+			ctx:  func(ctx context.Context) context.Context { return ctx },
+			req:  &ofrep.EvaluateBulkRequest{},
+			want: []map[string]any{
+				{
+					"scope":       "namespace",
+					"environment": "default",
+					"namespace":   "default",
+					"action":      "evaluate",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []map[string]any
+			// capture each request via a verifier that records inputs
+			recording := &recordingVerifier{allow: true, requests: &got}
+			ctx := authmiddlewaregrpc.ContextWithAuthentication(t.Context(), adminAuth)
+			ctx = tt.ctx(ctx)
+			info := &grpc.UnaryServerInfo{Server: &mockServer{}, FullMethod: "/test.Service/Method"}
+
+			called := false
+			_, err := AuthorizationRequiredInterceptor(zap.NewNop(), recording)(ctx, tt.req, info, func(ctx context.Context, _ any) (any, error) {
+				called = true
+				require.True(t, authz.IsAuthorizationRequired(ctx))
+				return nil, nil
+			})
+
+			require.NoError(t, err)
+			require.True(t, called)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+type recordingVerifier struct {
+	mockPolicyVerifier
+	allow    bool
+	requests *[]map[string]any
+}
+
+func (v *recordingVerifier) IsAllowed(_ context.Context, input map[string]any) (bool, error) {
+	*v.requests = append(*v.requests, input["request"].(map[string]any))
+	return v.allow, nil
+}
+
+type stubServerStream struct {
+	grpc.ServerStream
+	ctx    context.Context
+	onRecv func(m any) error
+}
+
+func (s *stubServerStream) Context() context.Context {
+	return s.ctx
+}
+
+func (s *stubServerStream) RecvMsg(m any) error {
+	return s.onRecv(m)
+}
+
+func TestAuthorizationRequiredStreamInterceptor(t *testing.T) {
+	newStreamCtx := func() context.Context {
+		return authmiddlewaregrpc.ContextWithAuthentication(t.Context(), adminAuth)
+	}
+
+	t.Run("allowed", func(t *testing.T) {
+		want := &rpcevaluationv2.EvaluationNamespaceSnapshotStreamRequest{
+			Key:            "team-a",
+			EnvironmentKey: "production",
+		}
+
+		stream := &stubServerStream{
+			ctx: newStreamCtx(),
+			onRecv: func(m any) error {
+				dst, ok := m.(*rpcevaluationv2.EvaluationNamespaceSnapshotStreamRequest)
+				require.True(t, ok)
+				dst.Key = want.Key
+				dst.EnvironmentKey = want.EnvironmentKey
+				if want.Digest != nil {
+					dst.Digest = want.Digest
+				}
+				return nil
+			},
+		}
+		info := &grpc.StreamServerInfo{FullMethod: "/evaluation.ClientEvaluationService/EvaluationSnapshotNamespaceStream"}
+
+		verifier := &mockPolicyVerifier{isAllowed: true}
+		called := false
+		err := AuthorizationRequiredStreamInterceptor(zap.NewNop(), verifier)(&mockServer{}, stream, info, func(_ any, stream grpc.ServerStream) error {
+			called = true
+
+			var got rpcevaluationv2.EvaluationNamespaceSnapshotStreamRequest
+			require.NoError(t, stream.RecvMsg(&got))
+			assert.True(t, authz.IsAuthorizationRequired(stream.Context()))
+			assert.Equal(t, want, &got)
+			return nil
+		})
+
+		require.NoError(t, err)
+		assert.True(t, called)
+		assert.Equal(t, map[string]any{
+			"scope":       "namespace",
+			"environment": "production",
+			"namespace":   "team-a",
+			"action":      "evaluate",
+		}, verifier.input["request"])
+	})
+
+	t.Run("denied", func(t *testing.T) {
+		stream := &stubServerStream{
+			ctx: newStreamCtx(),
+			onRecv: func(m any) error {
+				dst, ok := m.(*rpcevaluationv2.EvaluationNamespaceSnapshotStreamRequest)
+				require.True(t, ok)
+				dst.Key = "team-b"
+				dst.EnvironmentKey = "production"
+				return nil
+			},
+		}
+		info := &grpc.StreamServerInfo{FullMethod: "/evaluation.ClientEvaluationService/EvaluationSnapshotNamespaceStream"}
+
+		called := false
+		err := AuthorizationRequiredStreamInterceptor(zap.NewNop(), &mockPolicyVerifier{})(&mockServer{}, stream, info, func(_ any, stream grpc.ServerStream) error {
+			called = true
+			var got rpcevaluationv2.EvaluationNamespaceSnapshotStreamRequest
+			return stream.RecvMsg(&got)
+		})
+
+		require.Error(t, err)
+		assert.True(t, called)
+	})
+
+	t.Run("skips authorization", func(t *testing.T) {
+		stream := &stubServerStream{
+			ctx: t.Context(),
+			onRecv: func(_ any) error {
+				t.Error("RecvMsg should not be called when authorization is skipped")
+				return nil
+			},
+		}
+		info := &grpc.StreamServerInfo{FullMethod: "/evaluation.ClientEvaluationService/EvaluationSnapshotNamespaceStream"}
+
+		called := false
+		err := AuthorizationRequiredStreamInterceptor(zap.NewNop(), &mockPolicyVerifier{})(&mockServer{skipsAuthz: true}, stream, info, func(_ any, _ grpc.ServerStream) error {
+			called = true
+			return nil
+		})
+
+		require.NoError(t, err)
+		assert.True(t, called)
+	})
+}
+
+func TestAuthorizationRequiredInterceptor(t *testing.T) {
+	tests := []struct {
+		name                             string
+		server                           any
+		req                              any
+		authn                            *authrpc.Authentication
+		validatorAllowed                 bool
+		validatorErr                     error
+		wantAllowed                      bool
+		authzInput                       map[string]any
+		viewableEnvironments             []string
+		viewableNamespacesForEnvironment map[string][]string
+		serverFullMethod                 string
+	}{
+		{
+			name:  "allowed",
+			authn: adminAuth,
+			req: &environments.UpdateResourceRequest{
+				EnvironmentKey: "default",
+				NamespaceKey:   "default",
+				Key:            "some_flag",
+				Payload: &anypb.Any{
+					TypeUrl: "flipt.core.Flag",
+					Value:   []byte(`{"key":"some_flag","name":"Some Flag","description":"Some description","enabled":true}`),
+				},
+			},
+			validatorAllowed: true,
+			wantAllowed:      true,
+			authzInput: map[string]any{
+				"request": map[string]any{
+					"scope":       "namespace",
+					"environment": "default",
+					"namespace":   "default",
+					"action":      "update",
+				},
+				"authentication": map[string]any{
+					"id":     "",
+					"method": 0,
+					"metadata": map[string]string{
+						"io.flipt.auth.role": "admin",
+					},
+				},
+			},
+		},
+		{
+			name:  "not allowed",
+			authn: adminAuth,
+			req: &environments.UpdateResourceRequest{
+				EnvironmentKey: "default",
+				NamespaceKey:   "default",
+				Key:            "some_other_flag",
+			},
+			validatorAllowed: false,
+			wantAllowed:      false,
+		},
+		{
+			name: "skips authz",
+			server: &mockServer{
+				skipsAuthz: true,
+			},
+			req:         &environments.UpdateResourceRequest{},
+			wantAllowed: true,
+		},
+		{
+			name:        "no auth",
+			req:         &environments.UpdateResourceRequest{},
+			wantAllowed: false,
+		},
+		{
+			name:        "invalid request",
+			authn:       adminAuth,
+			req:         struct{}{},
+			wantAllowed: false,
+		},
+		{
+			name:         "validator error",
+			authn:        adminAuth,
+			req:          &environments.UpdateResourceRequest{},
+			validatorErr: errors.New("error"),
+			wantAllowed:  false,
+		},
+		{
+			name:                             "list namespaces",
+			authn:                            adminAuth,
+			req:                              &environments.ListNamespacesRequest{EnvironmentKey: "default"},
+			wantAllowed:                      true,
+			viewableEnvironments:             []string{"default"},
+			viewableNamespacesForEnvironment: map[string][]string{"default": {"default"}},
+			serverFullMethod:                 "/environments.EnvironmentsService/ListNamespaces",
+			authzInput: map[string]any{
+				"request": map[string]any{
+					"scope":       "environment",
+					"environment": "default",
+					"action":      "read",
+				},
+				"authentication": map[string]any{
+					"id":     "",
+					"method": 0,
+					"metadata": map[string]string{
+						"io.flipt.auth.role": "admin",
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var (
+				logger  = zap.NewNop()
+				allowed = false
+
+				ctx     = authmiddlewaregrpc.ContextWithAuthentication(t.Context(), tt.authn)
+				handler = func(ctx context.Context, req any) (any, error) {
+					allowed = true
+					return nil, nil
+				}
+
+				srv           = &grpc.UnaryServerInfo{Server: &mockServer{}}
+				policyVerfier = &mockPolicyVerifier{
+					isAllowed:                        tt.validatorAllowed,
+					wantErr:                          tt.validatorErr,
+					viewableEnvironments:             tt.viewableEnvironments,
+					viewableNamespacesForEnvironment: tt.viewableNamespacesForEnvironment,
+				}
+			)
+
+			if tt.server != nil {
+				srv.Server = tt.server
+			}
+			srv.FullMethod = tt.serverFullMethod
+
+			_, err := AuthorizationRequiredInterceptor(logger, policyVerfier)(ctx, tt.req, srv, handler)
+
+			require.Equal(t, tt.wantAllowed, allowed)
+
+			if tt.wantAllowed {
+				require.NoError(t, err)
+				assert.Equal(t, tt.authzInput, policyVerfier.input)
+				return
+			}
+
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestAuthorizationRequiredInterceptor_SkippedServers(t *testing.T) {
+	// skippedSrv stands in for a server excluded from authentication (e.g. the
+	// evaluation server when authentication.exclude.evaluation is true). Such
+	// requests carry no authentication, so authorization must skip them instead
+	// of denying every request.
+	skippedSrv := &mockServer{}
+
+	newInterceptor := func(verifier *mockPolicyVerifier) grpc.UnaryServerInterceptor {
+		return AuthorizationRequiredInterceptor(zap.NewNop(), verifier, WithServerSkipsAuthorization(skippedSrv))
+	}
+
+	newRequest := func() *rpcevaluation.EvaluationRequest {
+		return &rpcevaluation.EvaluationRequest{
+			EnvironmentKey: "production",
+			NamespaceKey:   "default",
+		}
+	}
+
+	t.Run("skipped server without authentication", func(t *testing.T) {
+		verifier := &mockPolicyVerifier{}
+		info := &grpc.UnaryServerInfo{Server: skippedSrv, FullMethod: "/flipt.evaluation.EvaluationService/Evaluate"}
+
+		called := false
+		_, err := newInterceptor(verifier)(t.Context(), newRequest(), info, func(context.Context, any) (any, error) {
+			called = true
+			return nil, nil
+		})
+
+		require.NoError(t, err)
+		assert.True(t, called)
+		assert.Nil(t, verifier.input, "policy verifier must not be consulted for skipped servers")
+	})
+
+	t.Run("other servers without authentication are denied", func(t *testing.T) {
+		verifier := &mockPolicyVerifier{}
+		info := &grpc.UnaryServerInfo{Server: &mockServer{}, FullMethod: "/flipt.evaluation.EvaluationService/Evaluate"}
+
+		called := false
+		_, err := newInterceptor(verifier)(t.Context(), newRequest(), info, func(context.Context, any) (any, error) {
+			called = true
+			return nil, nil
+		})
+
+		require.Error(t, err)
+		assert.False(t, called)
+	})
+}
+
+func TestAuthorizationRequiredStreamInterceptor_SkippedServers(t *testing.T) {
+	// skippedSrv stands in for a server excluded from authentication (e.g. the
+	// client evaluation server when authentication.exclude.evaluation is true).
+	skippedSrv := &mockServer{}
+
+	newInterceptor := func(verifier *mockPolicyVerifier) grpc.StreamServerInterceptor {
+		return AuthorizationRequiredStreamInterceptor(zap.NewNop(), verifier, WithServerSkipsAuthorization(skippedSrv))
+	}
+
+	const fullMethod = "/evaluation.ClientEvaluationService/EvaluationSnapshotNamespaceStream"
+
+	t.Run("skipped server without authentication", func(t *testing.T) {
+		stream := &stubServerStream{
+			ctx: t.Context(),
+			onRecv: func(_ any) error {
+				t.Error("RecvMsg should not be called when authorization is skipped")
+				return nil
+			},
+		}
+		info := &grpc.StreamServerInfo{FullMethod: fullMethod}
+
+		called := false
+		err := newInterceptor(&mockPolicyVerifier{})(skippedSrv, stream, info, func(_ any, _ grpc.ServerStream) error {
+			called = true
+			return nil
+		})
+
+		require.NoError(t, err)
+		assert.True(t, called)
+	})
+
+	t.Run("other servers without authentication are denied", func(t *testing.T) {
+		stream := &stubServerStream{
+			ctx: t.Context(),
+			onRecv: func(m any) error {
+				dst, ok := m.(*rpcevaluationv2.EvaluationNamespaceSnapshotStreamRequest)
+				require.True(t, ok)
+				dst.Key = "team-a"
+				dst.EnvironmentKey = "production"
+				return nil
+			},
+		}
+		info := &grpc.StreamServerInfo{FullMethod: fullMethod}
+
+		called := false
+		err := newInterceptor(&mockPolicyVerifier{})(&mockServer{}, stream, info, func(_ any, stream grpc.ServerStream) error {
+			called = true
+			var got rpcevaluationv2.EvaluationNamespaceSnapshotStreamRequest
+			return stream.RecvMsg(&got)
+		})
+
+		require.Error(t, err)
+		assert.True(t, called)
+	})
+}
+
+func TestAuthorizationRequiredInterceptor_AuthenticationService(t *testing.T) {
+	principal := &authrpc.Authentication{Id: "caller"}
+
+	t.Run("management methods are authorized against the authentication scope", func(t *testing.T) {
+		tests := []struct {
+			name       string
+			fullMethod string
+			req        any
+			action     flipt.Action
+		}{
+			{
+				name:       "list authentications",
+				fullMethod: authrpc.AuthenticationService_ListAuthentications_FullMethodName,
+				req:        &authrpc.ListAuthenticationsRequest{},
+				action:     flipt.ActionRead,
+			},
+			{
+				name:       "get authentication",
+				fullMethod: authrpc.AuthenticationService_GetAuthentication_FullMethodName,
+				req:        &authrpc.GetAuthenticationRequest{Id: "victim"},
+				action:     flipt.ActionRead,
+			},
+			{
+				name:       "delete authentication",
+				fullMethod: authrpc.AuthenticationService_DeleteAuthentication_FullMethodName,
+				req:        &authrpc.DeleteAuthenticationRequest{Id: "victim"},
+				action:     flipt.ActionDelete,
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name+" denied", func(t *testing.T) {
+				verifier := &mockPolicyVerifier{}
+				ctx := authmiddlewaregrpc.ContextWithAuthentication(t.Context(), principal)
+				info := &grpc.UnaryServerInfo{Server: &mockServer{}, FullMethod: tt.fullMethod}
+
+				called := false
+				_, err := AuthorizationRequiredInterceptor(zap.NewNop(), verifier)(ctx, tt.req, info, func(context.Context, any) (any, error) {
+					called = true
+					return nil, nil
+				})
+
+				require.ErrorIs(t, err, errUnauthorized)
+				assert.False(t, called)
+				assert.Equal(t, map[string]any{
+					"scope":  string(flipt.ScopeAuthentication),
+					"action": string(tt.action),
+				}, verifier.input["request"])
+			})
+
+			t.Run(tt.name+" allowed", func(t *testing.T) {
+				verifier := &mockPolicyVerifier{isAllowed: true}
+				ctx := authmiddlewaregrpc.ContextWithAuthentication(t.Context(), adminAuth)
+				info := &grpc.UnaryServerInfo{Server: &mockServer{}, FullMethod: tt.fullMethod}
+
+				called := false
+				_, err := AuthorizationRequiredInterceptor(zap.NewNop(), verifier)(ctx, tt.req, info, func(context.Context, any) (any, error) {
+					called = true
+					return nil, nil
+				})
+
+				require.NoError(t, err)
+				assert.True(t, called)
+				assert.Equal(t, map[string]any{
+					"scope":  string(flipt.ScopeAuthentication),
+					"action": string(tt.action),
+				}, verifier.input["request"])
+			})
+		}
+	})
+
+	t.Run("every method is authorized or explicitly skipped", func(t *testing.T) {
+		service := authrpc.File_auth_auth_proto.Services().ByName("AuthenticationService")
+		require.NotNil(t, service)
+
+		methods := service.Methods()
+		for i := range methods.Len() {
+			method := methods.Get(i)
+			fullMethod := fmt.Sprintf("/%s/%s", service.FullName(), method.Name())
+			if _, ok := skippedMethods[fullMethod]; ok {
+				continue
+			}
+
+			msg, err := protoregistry.GlobalTypes.FindMessageByName(method.Input().FullName())
+			require.NoError(t, err)
+			_, ok := msg.New().Interface().(flipt.Requester)
+			assert.True(t, ok, "%s must implement flipt.Requester or be listed in skippedMethods", fullMethod)
+		}
+	})
+
+	t.Run("self methods skip authorization", func(t *testing.T) {
+		tests := []struct {
+			fullMethod string
+			req        any
+		}{
+			{fullMethod: authrpc.AuthenticationService_GetAuthenticationSelf_FullMethodName, req: &emptypb.Empty{}},
+			{fullMethod: authrpc.AuthenticationService_ExpireAuthenticationSelf_FullMethodName, req: &authrpc.ExpireAuthenticationSelfRequest{}},
+			{fullMethod: authrpc.AuthenticationService_RevokeAuthenticationSelf_FullMethodName, req: &authrpc.RevokeAuthenticationSelfRequest{}},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.fullMethod, func(t *testing.T) {
+				verifier := &mockPolicyVerifier{}
+				ctx := authmiddlewaregrpc.ContextWithAuthentication(t.Context(), principal)
+				info := &grpc.UnaryServerInfo{Server: &mockServer{}, FullMethod: tt.fullMethod}
+
+				called := false
+				_, err := AuthorizationRequiredInterceptor(zap.NewNop(), verifier)(ctx, tt.req, info, func(context.Context, any) (any, error) {
+					called = true
+					return nil, nil
+				})
+
+				require.NoError(t, err)
+				assert.True(t, called)
+				assert.Nil(t, verifier.input, "policy verifier must not be consulted for self methods")
+			})
+		}
+	})
+}
+
+// environmentVerifier allows requests only for a single environment.
+type environmentVerifier struct {
+	mockPolicyVerifier
+	environment string
+}
+
+func (v *environmentVerifier) IsAllowed(_ context.Context, input map[string]any) (bool, error) {
+	request, _ := input["request"].(map[string]any)
+	return request["environment"] == v.environment, nil
+}
+
+func TestListFlagsAuthorizesHeaderEnvironment(t *testing.T) {
+	// The X-Flipt-Environment header takes precedence over environment_key on
+	// ListFlags, so it must be applied before authorization. Chain the header
+	// and authorization interceptors in the server's order to guard against
+	// the header environment being served without being authorized.
+	tests := []struct {
+		name    string
+		header  string
+		wantErr error
+	}{
+		{name: "header environment not allowed", header: "production", wantErr: errUnauthorized},
+		{name: "header environment allowed", header: "default"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := authmiddlewaregrpc.ContextWithAuthentication(t.Context(), &authrpc.Authentication{Id: "caller"})
+			ctx = metadata.NewIncomingContext(ctx, metadata.New(map[string]string{servercommon.HeaderFliptEnvironment: tt.header}))
+			info := &grpc.UnaryServerInfo{Server: &mockServer{}, FullMethod: flipt.Flipt_ListFlags_FullMethodName}
+			req := &flipt.ListFlagRequest{EnvironmentKey: "default", NamespaceKey: "default"}
+
+			headers := middlewaregrpc.FliptHeadersUnaryInterceptor(zap.NewNop())
+			authorize := AuthorizationRequiredInterceptor(zap.NewNop(), &environmentVerifier{environment: "default"})
+
+			var served string
+			_, err := headers(ctx, req, info, func(ctx context.Context, req any) (any, error) {
+				return authorize(ctx, req, info, func(_ context.Context, req any) (any, error) {
+					served = req.(*flipt.ListFlagRequest).EnvironmentKey
+					return nil, nil
+				})
+			})
+
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+				assert.Empty(t, served, "handler must not be called")
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.header, served)
+		})
+	}
+}
+
+func TestBatchEvaluationAuthorizesHeaderEnvironment(t *testing.T) {
+	// A batch item with a blank environment_key is served from the
+	// X-Flipt-Environment header, so it must be authorized against it. Chain
+	// the interceptors in the server's order.
+	tests := []struct {
+		name    string
+		header  string
+		wantErr error
+	}{
+		{name: "header environment not allowed", header: "production", wantErr: errUnauthorized},
+		{name: "header environment allowed", header: "default"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := authmiddlewaregrpc.ContextWithAuthentication(t.Context(), &authrpc.Authentication{Id: "caller"})
+			ctx = metadata.NewIncomingContext(ctx, metadata.New(map[string]string{servercommon.HeaderFliptEnvironment: tt.header}))
+			info := &grpc.UnaryServerInfo{Server: &mockServer{}, FullMethod: rpcevaluation.EvaluationService_Batch_FullMethodName}
+			req := &rpcevaluation.BatchEvaluationRequest{
+				Requests: []*rpcevaluation.EvaluationRequest{{NamespaceKey: "default", FlagKey: "flag"}},
+			}
+
+			headers := middlewaregrpc.FliptHeadersUnaryInterceptor(zap.NewNop())
+			evaluation := middlewaregrpc.EvaluationUnaryInterceptor()
+			authorize := AuthorizationRequiredInterceptor(zap.NewNop(), &environmentVerifier{environment: "default"})
+
+			called := false
+			_, err := headers(ctx, req, info, func(ctx context.Context, req any) (any, error) {
+				return evaluation(ctx, req, info, func(ctx context.Context, req any) (any, error) {
+					return authorize(ctx, req, info, func(_ context.Context, req any) (any, error) {
+						called = true
+						assert.Equal(t, tt.header, req.(*rpcevaluation.BatchEvaluationRequest).Requests[0].EnvironmentKey)
+						return &rpcevaluation.BatchEvaluationResponse{}, nil
+					})
+				})
+			})
+
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+				assert.False(t, called, "handler must not be called")
+				return
+			}
+
+			require.NoError(t, err)
+			assert.True(t, called)
+		})
+	}
+}
+
+func TestAuthorizationRequiredInterceptor_AnalyticsService(t *testing.T) {
+	t.Run("server does not skip authorization", func(t *testing.T) {
+		assert.False(t, skippedServer(t.Context(), analytics.New(zap.NewNop(), nil)))
+	})
+
+	tests := []struct {
+		name       string
+		fullMethod string
+		req        any
+	}{
+		{
+			name:       "flag evaluations count",
+			fullMethod: rpcanalytics.AnalyticsService_GetFlagEvaluationsCount_FullMethodName,
+			req:        &rpcanalytics.GetFlagEvaluationsCountRequest{EnvironmentKey: "production", NamespaceKey: "team-a", FlagKey: "flag"},
+		},
+		{
+			name:       "batch flag evaluations count",
+			fullMethod: rpcanalytics.AnalyticsService_GetBatchFlagEvaluationsCount_FullMethodName,
+			req:        &rpcanalytics.GetBatchFlagEvaluationsCountRequest{EnvironmentKey: "production", NamespaceKey: "team-a", FlagKeys: []string{"flag"}},
+		},
+	}
+
+	want := map[string]any{
+		"scope":       string(flipt.ScopeNamespace),
+		"action":      string(flipt.ActionRead),
+		"environment": "production",
+		"namespace":   "team-a",
+	}
+
+	for _, tt := range tests {
+		for _, allowed := range []bool{false, true} {
+			name := tt.name + " denied"
+			if allowed {
+				name = tt.name + " allowed"
+			}
+
+			t.Run(name, func(t *testing.T) {
+				verifier := &mockPolicyVerifier{isAllowed: allowed}
+				ctx := authmiddlewaregrpc.ContextWithAuthentication(t.Context(), &authrpc.Authentication{Id: "caller"})
+				info := &grpc.UnaryServerInfo{Server: analytics.New(zap.NewNop(), nil), FullMethod: tt.fullMethod}
+
+				called := false
+				_, err := AuthorizationRequiredInterceptor(zap.NewNop(), verifier)(ctx, tt.req, info, func(context.Context, any) (any, error) {
+					called = true
+					return nil, nil
+				})
+
+				assert.Equal(t, want, verifier.input["request"])
+				assert.Equal(t, allowed, called)
+				if allowed {
+					require.NoError(t, err)
+				} else {
+					require.ErrorIs(t, err, errUnauthorized)
+				}
+			})
+		}
+	}
+}

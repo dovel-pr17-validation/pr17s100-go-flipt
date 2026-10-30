@@ -1,0 +1,609 @@
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"runtime/debug"
+	"slices"
+	"sync"
+
+	prom "github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	otlpruntime "go.opentelemetry.io/contrib/instrumentation/runtime"
+
+	"go.opentelemetry.io/contrib/propagators/autoprop"
+
+	"github.com/fullstorydev/grpchan"
+	"github.com/fullstorydev/grpchan/inprocgrpc"
+	"go.flipt.io/flipt/internal/config"
+	"go.flipt.io/flipt/internal/containers"
+	"go.flipt.io/flipt/internal/coss/license"
+	"go.flipt.io/flipt/internal/coss/webhook"
+	"go.flipt.io/flipt/internal/info"
+	"go.flipt.io/flipt/internal/otel"
+	"go.flipt.io/flipt/internal/otel/metrics"
+	tracing "go.flipt.io/flipt/internal/otel/traces"
+	"go.flipt.io/flipt/internal/secrets"
+
+	// Import providers to trigger their init functions
+	_ "go.flipt.io/flipt/internal/secrets/file"
+	serverfliptv1 "go.flipt.io/flipt/internal/server"
+	analytics "go.flipt.io/flipt/internal/server/analytics"
+	"go.flipt.io/flipt/internal/server/analytics/clickhouse"
+	"go.flipt.io/flipt/internal/server/analytics/prometheus"
+	authnmiddlewaregrpc "go.flipt.io/flipt/internal/server/authn/middleware/grpc"
+	"go.flipt.io/flipt/internal/server/authz"
+	authzrego "go.flipt.io/flipt/internal/server/authz/engine/rego"
+	authzmiddlewaregrpc "go.flipt.io/flipt/internal/server/authz/middleware/grpc"
+	serverenvironments "go.flipt.io/flipt/internal/server/environments"
+	"go.flipt.io/flipt/internal/server/evaluation"
+	serverclientevaluation "go.flipt.io/flipt/internal/server/evaluation/client"
+	"go.flipt.io/flipt/internal/server/evaluation/ofrep"
+	"go.flipt.io/flipt/internal/server/metadata"
+	middlewaregrpc "go.flipt.io/flipt/internal/server/middleware/grpc"
+	"go.flipt.io/flipt/internal/storage/environments"
+	rpcflipt "go.flipt.io/flipt/rpc/flipt"
+	rpcevaluation "go.flipt.io/flipt/rpc/flipt/evaluation"
+	rpcmeta "go.flipt.io/flipt/rpc/flipt/meta"
+	rpcoffrep "go.flipt.io/flipt/rpc/flipt/ofrep"
+	rpcanalytics "go.flipt.io/flipt/rpc/v2/analytics"
+	rpcenv "go.flipt.io/flipt/rpc/v2/environments"
+	rpcevaluationv2 "go.flipt.io/flipt/rpc/v2/evaluation"
+	opentelemetry "go.opentelemetry.io/otel"
+	metricsdk "go.opentelemetry.io/otel/sdk/metric"
+	tracesdk "go.opentelemetry.io/otel/sdk/trace"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zapgrpc"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/grpclog"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
+
+	grpcprom "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
+	grpclogging "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
+	grpcrecovery "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/recovery"
+	grpcselector "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/selector"
+	grpchealth "google.golang.org/grpc/health/grpc_health_v1"
+)
+
+// GRPCServerOption defines a functional option for configuring GRPCServer
+type GRPCServerOption func(*grpcServerOptions)
+
+// grpcServerOptions holds configuration options for the GRPC server
+type grpcServerOptions struct {
+	forceMigrate bool
+}
+
+// WithForceMigrate configures the GRPC server to force database migrations
+func WithForceMigrate() GRPCServerOption {
+	return func(opts *grpcServerOptions) {
+		opts.forceMigrate = true
+	}
+}
+
+const (
+	// healthServiceManagement covers the management APIs (Flipt,
+	// Environments, Metadata). SERVING once the environment store —
+	// including its initial fetch — is constructed.
+	healthServiceManagement = "management"
+	// healthServiceEvaluation covers the evaluation APIs. SERVING once every
+	// static environment has a parsed snapshot available for evaluation.
+	healthServiceEvaluation = "evaluation"
+)
+
+// evaluationHealthAggregator tracks per-environment snapshot readiness and
+// flips the evaluation health service to SERVING once all expected static
+// environments have reported. Sticky: it never flips back — later rebuild
+// failures keep serving the last-good snapshot.
+type evaluationHealthAggregator struct {
+	mu       sync.Mutex
+	expected map[string]struct{}
+	ready    map[string]struct{}
+	health   *health.Server
+	serving  bool
+}
+
+func newEvaluationHealthAggregator(healthSrv *health.Server, expected []string) *evaluationHealthAggregator {
+	exp := make(map[string]struct{}, len(expected))
+	for _, k := range expected {
+		exp[k] = struct{}{}
+	}
+	return &evaluationHealthAggregator{
+		expected: exp,
+		ready:    make(map[string]struct{}, len(expected)),
+		health:   healthSrv,
+	}
+}
+
+// ReportSnapshotReady implements environments.SnapshotReadyReporter.
+func (a *evaluationHealthAggregator) ReportSnapshotReady(envKey string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.serving {
+		return
+	}
+	if _, ok := a.expected[envKey]; !ok {
+		return
+	}
+	a.ready[envKey] = struct{}{}
+	if len(a.ready) == len(a.expected) {
+		a.serving = true
+		a.health.SetServingStatus(healthServiceEvaluation, grpchealth.HealthCheckResponse_SERVING)
+	}
+}
+
+// serverSpansRequired reports whether gRPC server spans must be created.
+// Analytics consumes evaluation span events in-process via a span processor,
+// so ClickHouse analytics needs server spans even when tracing export is
+// disabled. Without the OTel server stats handler no span exists in the
+// request context and evaluation events are silently dropped (no ClickHouse
+// rows). See the v1 audit analogue in PR #6280.
+func serverSpansRequired(cfg *config.Config) bool {
+	return cfg.Tracing.Enabled || cfg.Analytics.Storage.Clickhouse.Enabled
+}
+
+// GRPCServer configures the dependencies associated with the Flipt GRPC Service.
+// It provides an entrypoint to start serving the gRPC stack (Run()).
+// Along with a teardown function (Shutdown(ctx)).
+type GRPCServer struct {
+	*grpc.Server
+
+	logger *zap.Logger
+	cfg    *config.Config
+	ln     net.Listener
+
+	webhookReceiver *webhook.Receiver
+
+	shutdownFuncs []func(context.Context) error
+}
+
+// NewGRPCServer constructs the core Flipt gRPC service including its dependencies
+// (e.g. tracing, metrics, storage, migrations, caching and cleanup).
+// It returns an instance of *GRPCServer which callers can Run().
+func NewGRPCServer(
+	ctx context.Context,
+	logger *zap.Logger,
+	cfg *config.Config,
+	ipch *inprocgrpc.Channel,
+	info info.Flipt,
+	licenseManager license.Manager,
+	secretsManager secrets.Manager,
+	opts ...GRPCServerOption,
+) (*GRPCServer, error) {
+	// Process functional options
+	options := &grpcServerOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	logger = logger.With(zap.String("server", "grpc"))
+	server := &GRPCServer{
+		logger: logger,
+		cfg:    cfg,
+	}
+
+	// acts as a registry for all grpc services so they can be shared between
+	// the grpc server and the in-process client connection
+	handlers := &grpchan.HandlerMap{}
+
+	var err error
+	lc := &net.ListenConfig{}
+	server.ln, err = lc.Listen(ctx, "tcp", fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.GRPCPort))
+	if err != nil {
+		return nil, fmt.Errorf("creating grpc listener: %w", err)
+	}
+
+	server.onShutdown(func(context.Context) error {
+		return server.ln.Close()
+	})
+
+	// health service starts UNKNOWN for per-service readiness and is
+	// flipped event-driven as dependencies become ready. Shutdown flips
+	// everything to NOT_SERVING via healthsrv.Shutdown().
+	healthsrv := health.NewServer()
+	healthsrv.SetServingStatus(healthServiceManagement, grpchealth.HealthCheckResponse_UNKNOWN)
+	healthsrv.SetServingStatus(healthServiceEvaluation, grpchealth.HealthCheckResponse_UNKNOWN)
+
+	expectedEnvs := make([]string, 0, len(cfg.Environments))
+	for name, envConf := range cfg.Environments {
+		if envConf != nil && envConf.Name != "" {
+			expectedEnvs = append(expectedEnvs, envConf.Name)
+		} else {
+			expectedEnvs = append(expectedEnvs, name)
+		}
+	}
+	evalHealth := newEvaluationHealthAggregator(healthsrv, expectedEnvs)
+
+	// configure a declarative backend store
+	// static environments report snapshot readiness event-driven via evalHealth
+	environmentStore, err := environments.NewStore(ctx, logger, cfg, secretsManager, licenseManager, environments.WithStoreSnapshotReadyReporter(evalHealth))
+	if err != nil {
+		return nil, fmt.Errorf("initializing environment store: %w", err)
+	}
+
+	server.webhookReceiver, err = newWebhookReceiver(ctx, logger, cfg, environmentStore, licenseManager)
+	if err != nil {
+		return nil, fmt.Errorf("initializing webhook receiver: %w", err)
+	}
+
+	otelResource, err := otel.NewResource(ctx, info.Build.Version)
+	if err != nil {
+		return nil, fmt.Errorf("creating otel resource: %w", err)
+	}
+
+	// Initialize metrics exporter if enabled
+	if cfg.Metrics.Enabled {
+		metricExp, metricExpShutdown, err := metrics.GetExporter(ctx, &cfg.Metrics)
+		if err != nil {
+			return nil, fmt.Errorf("creating metrics exporter: %w", err)
+		}
+
+		server.onShutdown(metricExpShutdown)
+
+		meterProvider := metricsdk.NewMeterProvider(
+			metricsdk.WithResource(otelResource),
+			metricsdk.WithReader(metricExp),
+		)
+		opentelemetry.SetMeterProvider(meterProvider)
+		server.onShutdown(meterProvider.Shutdown)
+
+		// We only want to start the runtime metrics by open telemetry if the user have chosen
+		// to use OTLP because the Prometheus endpoint already exposes those metrics.
+		if cfg.Metrics.Exporter == config.MetricsOTLP {
+			err = otlpruntime.Start(otlpruntime.WithMeterProvider(meterProvider))
+			if err != nil {
+				return nil, fmt.Errorf("starting runtime metric exporter: %w", err)
+			}
+		}
+
+		logger.Debug("otel metrics enabled", zap.String("exporter", string(cfg.Metrics.Exporter)))
+	}
+
+	// Initialize tracingProvider regardless of configuration. No extraordinary resources
+	// are consumed, or goroutines initialized until a SpanProcessor is registered.
+	tracingProvider := tracesdk.NewTracerProvider(
+		tracesdk.WithResource(otelResource),
+	)
+
+	server.onShutdown(tracingProvider.Shutdown)
+
+	if cfg.Tracing.Enabled {
+		exp, traceExpShutdown, err := tracing.GetExporter(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("creating tracing exporter: %w", err)
+		}
+
+		server.onShutdown(traceExpShutdown)
+
+		tracingProcessor := tracesdk.NewBatchSpanProcessor(exp)
+		server.onShutdown(tracingProcessor.Shutdown)
+
+		tracingProvider.RegisterSpanProcessor(tracingProcessor)
+		logger.Debug("otel tracing enabled")
+	}
+
+	opentelemetry.SetTracerProvider(tracingProvider)
+	opentelemetry.SetTextMapPropagator(autoprop.NewTextMapPropagator())
+
+	unaryMetricsInterceptor := func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
+		// fallback implementation
+		return h(ctx, req)
+	}
+
+	streamMetricsInterceptor := func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, h grpc.StreamHandler) error {
+		// fallback implementation
+		return h(srv, ss)
+	}
+
+	if cfg.Metrics.Enabled {
+		cs := grpcprom.NewServerMetrics(
+			grpcprom.WithServerHandlingTimeHistogram(),
+		)
+		prom.MustRegister(cs)
+		unaryMetricsInterceptor = cs.UnaryServerInterceptor()
+		streamMetricsInterceptor = cs.StreamServerInterceptor()
+	}
+
+	interceptorLogger := middlewaregrpc.ZapInterceptorLogger(logger)
+
+	// base inteceptors
+	recoveryHandler := func(p any) (err error) {
+		logger.Error("panic recovered", zap.Any("panic", p), zap.ByteString("stacktrace", debug.Stack()))
+		return status.Errorf(codes.Internal, "%v", p)
+	}
+	unaryInterceptors := []grpc.UnaryServerInterceptor{
+		grpcrecovery.UnaryServerInterceptor(grpcrecovery.WithRecoveryHandler(recoveryHandler)),
+		grpcselector.UnaryServerInterceptor(grpclogging.UnaryServerInterceptor(interceptorLogger, grpclogging.WithLogOnEvents(grpclogging.FinishCall)), grpcselector.MatchFunc(middlewaregrpc.LoggingSelector)),
+		unaryMetricsInterceptor,
+		middlewaregrpc.ErrorUnaryInterceptor,
+	}
+
+	streamInterceptors := []grpc.StreamServerInterceptor{
+		grpcrecovery.StreamServerInterceptor(grpcrecovery.WithRecoveryHandler(recoveryHandler)),
+		grpcselector.StreamServerInterceptor(grpclogging.StreamServerInterceptor(interceptorLogger, grpclogging.WithLogOnEvents(grpclogging.FinishCall)), grpcselector.MatchFunc(middlewaregrpc.LoggingSelector)),
+
+		streamMetricsInterceptor,
+		middlewaregrpc.ErrorStreamInterceptor,
+	}
+
+	var (
+		// legacy services
+		metasrv    = metadata.New(cfg, info)
+		evalsrv    = evaluation.New(logger, environmentStore, evaluation.WithTracing(cfg.Tracing.Enabled || cfg.Analytics.Storage.Clickhouse.Enabled), evaluation.WithMetrics(cfg.Metrics.Enabled), evaluation.WithAuthorizationEnabled(cfg.Authorization.Required && !cfg.Authorization.Exclude.Evaluation))
+		fliptv1srv = serverfliptv1.New(logger, environmentStore, serverfliptv1.WithFlagMetadata(cfg.Evaluation.IncludeFlagMetadata))
+		ofrepsrv   = ofrep.New(logger, evalsrv, environmentStore, ofrep.WithAuthorizationEnabled(cfg.Authorization.Required && !cfg.Authorization.Exclude.OFREP))
+	)
+
+	envsrv, err := serverenvironments.NewServer(logger, environmentStore)
+	if err != nil {
+		return nil, fmt.Errorf("building environments server: %w", err)
+	}
+
+	clientevalsrv := serverclientevaluation.NewServer(logger, environmentStore, serverclientevaluation.WithSkipOFREPAuthn(cfg.Authentication.Exclude.OFREP), serverclientevaluation.WithAuthorizationEnabled(cfg.Authorization.Required && !cfg.Authorization.Exclude.Evaluation))
+
+	var (
+		// authnOpts is a slice of options that will be passed to the authentication service.
+		// it's initialized with the default option of skipping authentication for the health service which should never require authentication.
+		authnOpts = []containers.Option[authnmiddlewaregrpc.InterceptorOptions]{
+			authnmiddlewaregrpc.WithServerSkipsAuthentication(healthsrv),
+		}
+		skipAuthnIfExcluded = func(server any, excluded bool) {
+			if excluded {
+				authnOpts = append(authnOpts, authnmiddlewaregrpc.WithServerSkipsAuthentication(server))
+			}
+		}
+	)
+
+	skipAuthnIfExcluded(evalsrv, cfg.Authentication.Exclude.Evaluation)
+	skipAuthnIfExcluded(clientevalsrv, cfg.Authentication.Exclude.Evaluation)
+	skipAuthnIfExcluded(ofrepsrv, cfg.Authentication.Exclude.OFREP)
+
+	authUnaryInterceptors, authStreamInterceptors, authShutdown, err := authenticationGRPC(
+		ctx,
+		logger,
+		cfg,
+		handlers,
+		authnOpts...,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	server.onShutdown(authShutdown)
+
+	if cfg.Analytics.Enabled() {
+		if cfg.Analytics.Storage.Clickhouse.Enabled {
+			client, err := clickhouse.New(logger, cfg, options.forceMigrate)
+			if err != nil {
+				return nil, fmt.Errorf("connecting to clickhouse: %w", err)
+			}
+			analyticsExporter := analytics.NewAnalyticsSinkSpanExporter(logger, client)
+			tracingProvider.RegisterSpanProcessor(
+				tracesdk.NewBatchSpanProcessor(
+					analyticsExporter,
+					tracesdk.WithBatchTimeout(cfg.Analytics.Buffer.FlushPeriod),
+				),
+			)
+			server.onShutdown(func(ctx context.Context) error {
+				return analyticsExporter.Shutdown(ctx)
+			})
+			rpcanalytics.RegisterAnalyticsServiceServer(handlers, analytics.New(logger, client))
+			logger.Debug("analytics enabled", zap.String("database", client.String()), zap.String("flush_period", cfg.Analytics.Buffer.FlushPeriod.String()))
+		} else if cfg.Analytics.Storage.Prometheus.Enabled {
+			client, err := prometheus.New(logger, cfg)
+			if err != nil {
+				return nil, err
+			}
+			rpcanalytics.RegisterAnalyticsServiceServer(handlers, analytics.New(logger, client))
+			logger.Debug("analytics enabled", zap.String("database", client.String()))
+		}
+	}
+
+	// register servers
+	rpcflipt.RegisterFliptServer(handlers, fliptv1srv)
+	rpcenv.RegisterEnvironmentsServiceServer(handlers, envsrv)
+	rpcmeta.RegisterMetadataServiceServer(handlers, metasrv)
+	rpcevaluation.RegisterEvaluationServiceServer(handlers, evalsrv)
+	rpcevaluationv2.RegisterClientEvaluationServiceServer(handlers, clientevalsrv)
+	rpcoffrep.RegisterOFREPServiceServer(handlers, ofrepsrv)
+
+	// forward internal gRPC logging to zap
+	grpcLogLevel, err := zapcore.ParseLevel(cfg.Log.GRPCLevel)
+	if err != nil {
+		return nil, fmt.Errorf("parsing grpc log level (%q): %w", cfg.Log.GRPCLevel, err)
+	}
+
+	grpclog.SetLoggerV2(zapgrpc.NewLogger(
+		logger.WithOptions(zap.IncreaseLevel(grpcLogLevel)),
+	))
+
+	// add auth interceptors to the server
+	unaryInterceptors = append(
+		unaryInterceptors,
+		append(
+			authUnaryInterceptors,
+			middlewaregrpc.FliptHeadersUnaryInterceptor(logger),
+			middlewaregrpc.EvaluationUnaryInterceptor(),
+		)...,
+	)
+
+	streamInterceptors = append(
+		streamInterceptors,
+		append(
+			authStreamInterceptors,
+			middlewaregrpc.FliptHeadersStreamInterceptor(logger),
+		)...,
+	)
+
+	if cfg.Authorization.Required {
+		authzOpts := []containers.Option[authzmiddlewaregrpc.InterceptorOptions]{
+			authzmiddlewaregrpc.WithServerSkipsAuthorization(healthsrv),
+		}
+
+		// Authorization requires an authentication to evaluate policy against.
+		// Sections of the API excluded from authentication carry none, so they
+		// must also skip authorization. Otherwise every request to them would
+		// be denied, even when authorization is opted in for those sections.
+		if cfg.Authentication.Exclude.Evaluation {
+			authzOpts = append(authzOpts,
+				authzmiddlewaregrpc.WithServerSkipsAuthorization(evalsrv),
+				authzmiddlewaregrpc.WithServerSkipsAuthorization(clientevalsrv),
+			)
+		}
+
+		if cfg.Authentication.Exclude.OFREP {
+			authzOpts = append(authzOpts,
+				authzmiddlewaregrpc.WithServerSkipsAuthorization(ofrepsrv),
+			)
+		}
+
+		var (
+			authzEngine   authz.Verifier
+			authzShutdown errFunc
+			err           error
+		)
+
+		authzEngine, authzShutdown, err = getAuthz(ctx, logger, cfg)
+		if err != nil {
+			return nil, err
+		}
+
+		server.onShutdown(authzShutdown)
+
+		// authz only applies to unary interceptors except for the client
+		// evaluation snapshot stream, which has its own stream interceptor
+		unaryInterceptors = append(unaryInterceptors, authzmiddlewaregrpc.AuthorizationRequiredInterceptor(logger, authzEngine, authzOpts...))
+		streamInterceptors = append(streamInterceptors, authzmiddlewaregrpc.AuthorizationRequiredStreamInterceptor(logger, authzEngine, authzOpts...))
+
+		logger.Info("authorization middleware enabled")
+	}
+
+	// we validate requests after authn and authz
+	unaryInterceptors = append(unaryInterceptors, middlewaregrpc.ValidationUnaryInterceptor)
+
+	grpcOpts := []grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(unaryInterceptors...),
+		grpc.ChainStreamInterceptor(streamInterceptors...),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle:     cfg.Server.GRPCConnectionMaxIdleTime,
+			MaxConnectionAge:      cfg.Server.GRPCConnectionMaxAge,
+			MaxConnectionAgeGrace: cfg.Server.GRPCConnectionMaxAgeGrace,
+		}),
+	}
+
+	if serverSpansRequired(cfg) {
+		statsHandler := otelgrpc.NewServerHandler()
+		grpcOpts = append(grpcOpts, grpc.StatsHandler(statsHandler))
+		ipch = ipch.WithServerStatsHandler(statsHandler)
+	}
+
+	if cfg.Server.Protocol == config.HTTPS {
+		creds, err := credentials.NewServerTLSFromFile(cfg.Server.CertFile, cfg.Server.CertKey)
+		if err != nil {
+			return nil, fmt.Errorf("loading TLS credentials: %w", err)
+		}
+
+		grpcOpts = append(grpcOpts, grpc.Creds(creds))
+	}
+
+	ipch = ipch.
+		WithServerUnaryInterceptor(middlewaregrpc.ChainUnaryServer(unaryInterceptors)).
+		WithServerStreamInterceptor(middlewaregrpc.ChainStreamServer(streamInterceptors))
+
+	// initialize grpc server
+	grpcServer := grpc.NewServer(grpcOpts...)
+	grpchealth.RegisterHealthServer(handlers, healthsrv)
+
+	// Management is SERVING: the environment store (including its initial
+	// fetch) constructed successfully. Construction failure returns early,
+	// so NOT_SERVING is only reachable via Shutdown().
+	healthsrv.SetServingStatus(healthServiceManagement, grpchealth.HealthCheckResponse_SERVING)
+	// Evaluation reflects the synchronous initial state; later snapshot
+	// successes flip it event-driven via evalHealth. Sticky SERVING:
+	// subsequent rebuild failures keep serving the last-good snapshot.
+	if environmentStore.EvaluationReady() {
+		healthsrv.SetServingStatus(healthServiceEvaluation, grpchealth.HealthCheckResponse_SERVING)
+	} else {
+		healthsrv.SetServingStatus(healthServiceEvaluation, grpchealth.HealthCheckResponse_NOT_SERVING)
+	}
+	// register grpc services onto the in-process client connection and the grpc server
+	handlers.ForEach(ipch.RegisterService)
+	handlers.ForEach(grpcServer.RegisterService)
+
+	// register grpcServer graceful stop on shutdown
+	server.onShutdown(func(context.Context) error {
+		healthsrv.Shutdown()
+		grpcServer.GracefulStop()
+		return nil
+	})
+
+	reflection.Register(grpcServer)
+
+	server.Server = grpcServer
+	return server, nil
+}
+
+// WebhookReceiver returns the incoming SCM webhook receiver, or nil when
+// incoming webhooks are not enabled. It is built here because it needs the
+// environment store, but it is served and shut down by the HTTP server (see
+// WithWebhookReceiver).
+func (s *GRPCServer) WebhookReceiver() *webhook.Receiver {
+	return s.webhookReceiver
+}
+
+// Run begins serving gRPC requests.
+// This methods blocks until Shutdown is called.
+func (s *GRPCServer) Run() error {
+	s.logger.Info("starting grpc server", zap.String("address", fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.GRPCPort)))
+	return s.Serve(s.ln)
+}
+
+// Shutdown tearsdown the entire gRPC stack including dependencies.
+func (s *GRPCServer) Shutdown(ctx context.Context) error {
+	s.logger.Info("shutting down GRPC server...")
+
+	// call in reverse order to emulate pop semantics of a stack
+	for _, fn := range slices.Backward(s.shutdownFuncs) {
+		if fn != nil {
+			if err := fn(ctx); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+type errFunc func(context.Context) error
+
+func (s *GRPCServer) onShutdown(fn errFunc) {
+	s.shutdownFuncs = append(s.shutdownFuncs, fn)
+}
+
+var (
+	authzOnce sync.Once
+	validator authz.Verifier
+	authzFunc errFunc = func(context.Context) error { return nil }
+	authzErr  error
+)
+
+func getAuthz(ctx context.Context, logger *zap.Logger, cfg *config.Config) (authz.Verifier, errFunc, error) {
+	authzOnce.Do(func() {
+		var err error
+		validator, err = authzrego.NewEngine(ctx, logger, cfg)
+		if err != nil {
+			authzErr = fmt.Errorf("creating authorization policy engine: %w", err)
+			return
+		}
+	})
+
+	return validator, authzFunc, authzErr
+}

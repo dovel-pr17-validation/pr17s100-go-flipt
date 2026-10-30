@@ -1,0 +1,66 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema-pro.json
+version: 2
+
+project_name: flipt
+
+git:
+  tag_sort: semver
+
+monorepo:
+  tag_prefix: v
+
+builds:
+  - builder: prebuilt
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    goamd64:
+      - v1
+    prebuilt:
+      path: tmp/dist/flipt_{{ .Os }}_{{ .Arch }}{{ with .Amd64 }}_{{ . }}{{ end }}{{ with .Arm64 }}_{{ . }}{{ end }}/flipt
+    binary: flipt
+
+sboms:
+  - artifacts: archive
+
+archives:
+  - id: main
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- tolower .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - LICENSE
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  prerelease: auto # enable rc releases (e.g. v1.0.0-rc.1)
+  target_commitish: "{{ .Commit }}"
+
+nightly:
+  # Static v2-nightly version for all nightly builds from v2 branch
+  version_template: "v2-nightly"
+
+changelog:
+  disable: true
+
+dockers_v2:
+  - dockerfile: ./build/Dockerfile
+    images:
+      - "flipt/flipt"
+      - "ghcr.io/flipt-io/flipt"
+    tags:
+      - "{{ .Version }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      "org.opencontainers.image.created": "{{.Date}}"
+      "org.opencontainers.image.revision": "{{.FullCommit}}"
+      "org.opencontainers.image.version": "{{.Version}}"

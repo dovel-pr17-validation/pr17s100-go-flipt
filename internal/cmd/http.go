@@ -1,0 +1,480 @@
+package cmd
+
+import (
+	"compress/gzip"
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
+	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.flipt.io/flipt/internal/config"
+	"go.flipt.io/flipt/internal/coss/webhook"
+	"go.flipt.io/flipt/internal/gateway"
+	"go.flipt.io/flipt/internal/info"
+	"go.flipt.io/flipt/internal/server/authn/method"
+	"go.flipt.io/flipt/internal/server/common"
+	ofrep_middleware "go.flipt.io/flipt/internal/server/evaluation/ofrep"
+	grpc_middleware "go.flipt.io/flipt/internal/server/middleware/grpc"
+	http_middleware "go.flipt.io/flipt/internal/server/middleware/http"
+	"go.flipt.io/flipt/rpc/flipt"
+	"go.flipt.io/flipt/rpc/flipt/evaluation"
+	"go.flipt.io/flipt/rpc/flipt/meta"
+	"go.flipt.io/flipt/rpc/flipt/ofrep"
+	"go.flipt.io/flipt/rpc/v2/analytics"
+	"go.flipt.io/flipt/rpc/v2/environments"
+	evaluationv2 "go.flipt.io/flipt/rpc/v2/evaluation"
+	"go.flipt.io/flipt/ui"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health/grpc_health_v1"
+)
+
+// HTTPServer is a wrapper around the construction and registration of Flipt's HTTP server.
+type HTTPServer struct {
+	*http.Server
+
+	logger *zap.Logger
+
+	// webhooks serves incoming SCM webhooks; nil when they are disabled.
+	webhooks webhookHandler
+
+	listenAndServe func() error
+}
+
+// newCORSHandler creates the CORS middleware handler from config.
+func newCORSHandler(cfg *config.Config) func(http.Handler) http.Handler {
+	return cors.New(cors.Options{
+		AllowedOrigins:   cfg.Cors.AllowedOrigins,
+		AllowedMethods:   []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions},
+		AllowedHeaders:   cfg.Cors.AllowedHeaders,
+		ExposedHeaders:   []string{"Link", "Etag"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}).Handler
+}
+
+// webhookHandler serves incoming SCM webhooks for an environment. Shutdown
+// waits for the fetches those webhooks triggered.
+type webhookHandler interface {
+	ServeWebhook(w http.ResponseWriter, r *http.Request, environment string)
+	Shutdown(ctx context.Context) error
+}
+
+// HTTPServerOption configures NewHTTPServer.
+type HTTPServerOption func(*httpServerOptions)
+
+type httpServerOptions struct {
+	webhooks webhookHandler
+}
+
+// WithWebhookReceiver serves incoming SCM webhooks at
+// POST /api/v2/webhooks/{environment}, and shuts the receiver down with the
+// server. A nil receiver leaves the route unregistered.
+func WithWebhookReceiver(receiver *webhook.Receiver) HTTPServerOption {
+	return func(o *httpServerOptions) {
+		if receiver != nil {
+			o.webhooks = receiver
+		}
+	}
+}
+
+// NewHTTPServer constructs and configures the HTTPServer instance.
+// The HTTPServer depends upon a running gRPC server instance which is why
+// it explicitly requires and established gRPC connection as an argument.
+func NewHTTPServer(
+	ctx context.Context,
+	logger *zap.Logger,
+	cfg *config.Config,
+	conn grpc.ClientConnInterface,
+	info info.Flipt,
+	opts ...HTTPServerOption,
+) (*HTTPServer, error) {
+	logger = logger.With(zap.Stringer("server", cfg.Server.Protocol))
+
+	var options httpServerOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	var (
+		server = &HTTPServer{
+			logger:   logger,
+			webhooks: options.webhooks,
+		}
+
+		r   = chi.NewRouter()
+		api = gateway.NewGatewayServeMux(logger,
+			runtime.WithMetadata(grpc_middleware.ForwardFliptEnvironment))
+
+		evaluateAPI = gateway.NewGatewayServeMux(logger,
+			runtime.WithMetadata(grpc_middleware.ForwardFliptEnvironment))
+
+		clientEvaluationAPI = gateway.NewGatewayServeMux(
+			logger,
+			runtime.WithMetadata(grpc_middleware.ForwardOFREPStreamMarker),
+			runtime.WithMetadata(grpc_middleware.ForwardFliptEnvironment),
+			runtime.WithForwardResponseOption(http_middleware.HttpResponseModifier),
+		)
+
+		analyticsAPI = gateway.NewGatewayServeMux(logger, runtime.WithMetadata(grpc_middleware.ForwardFliptEnvironment))
+
+		ofrepAPI = gateway.NewGatewayServeMux(
+			logger,
+			runtime.WithMetadata(grpc_middleware.ForwardFliptEnvironment),
+			runtime.WithMetadata(grpc_middleware.ForwardFliptNamespace),
+			runtime.WithForwardResponseOption(http_middleware.HttpResponseModifier),
+			runtime.WithErrorHandler(ofrep_middleware.ErrorHandler(logger)),
+		)
+
+		environmentsAPI = gateway.NewGatewayServeMux(logger)
+
+		httpPort = cfg.Server.HTTPPort
+	)
+
+	if cfg.Server.Protocol == config.HTTPS {
+		httpPort = cfg.Server.HTTPSPort
+	}
+
+	// v1
+	if err := flipt.RegisterFliptHandlerClient(ctx, api, flipt.NewFliptClient(conn)); err != nil {
+		return nil, fmt.Errorf("registering grpc gateway: %w", err)
+	}
+
+	if err := evaluation.RegisterEvaluationServiceHandlerClient(ctx, evaluateAPI, evaluation.NewEvaluationServiceClient(conn)); err != nil {
+		return nil, fmt.Errorf("registering grpc gateway: %w", err)
+	}
+
+	if err := ofrep.RegisterOFREPServiceHandlerClient(ctx, ofrepAPI, ofrep.NewOFREPServiceClient(conn)); err != nil {
+		return nil, fmt.Errorf("registering grpc gateway: %w", err)
+	}
+
+	// v2
+	if err := analytics.RegisterAnalyticsServiceHandlerClient(ctx, analyticsAPI, analytics.NewAnalyticsServiceClient(conn)); err != nil {
+		return nil, fmt.Errorf("registering grpc gateway: %w", err)
+	}
+
+	if err := environments.RegisterEnvironmentsServiceHandlerClient(ctx, environmentsAPI, environments.NewEnvironmentsServiceClient(conn)); err != nil {
+		return nil, fmt.Errorf("registering grpc gateway: %w", err)
+	}
+
+	if err := evaluationv2.RegisterClientEvaluationServiceHandlerClient(ctx, clientEvaluationAPI, evaluationv2.NewClientEvaluationServiceClient(conn)); err != nil {
+		return nil, fmt.Errorf("registering grpc gateway: %w", err)
+	}
+
+	if cfg.Cors.Enabled {
+		r.Use(newCORSHandler(cfg))
+		logger.Debug("CORS enabled", zap.Strings("allowed_origins", cfg.Cors.AllowedOrigins))
+	}
+
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// checking Values as map[string][]string also catches ?pretty and ?pretty=
+			// r.URL.Query().Get("pretty") would not.
+			if _, ok := r.URL.Query()["pretty"]; ok {
+				r.Header.Set("Accept", "application/json+pretty")
+			}
+
+			h.ServeHTTP(w, r)
+		})
+	})
+	r.Use(middleware.Compress(gzip.DefaultCompression))
+	r.Use(http_middleware.HandleNoBodyResponse)
+	r.Use(middleware.Recoverer)
+
+	if cfg.Diagnostics.Profiling.Enabled {
+		r.Mount("/debug", middleware.Profiler())
+	}
+
+	if cfg.Metrics.Enabled && cfg.Metrics.Exporter == config.MetricsPrometheus {
+		r.Mount("/metrics", promhttp.Handler())
+	}
+
+	r.Group(func(r chi.Router) {
+		r.Use(removeTrailingSlash)
+
+		if cfg.Tracing.Enabled {
+			r.Use(func(handler http.Handler) http.Handler {
+				return otelhttp.NewHandler(handler, "grpc-gateway")
+			})
+
+			r.Use(func(handler http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					ctx := r.Context()
+					// Make sure headers contain the trace context set up by otelhttp for
+					// later extraction by our custom grpc-gateway incoming header matcher.
+					// Usually this would be taken care of by otelgrpc client interceptors,
+					// but inprocgrpc does not provide client interceptors.
+					otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(r.Header))
+					// Use the new context with the span
+					r = r.WithContext(ctx)
+					handler.ServeHTTP(w, r)
+				})
+			})
+		}
+
+		if key := cfg.Authentication.Session.CSRF.Key; key != "" {
+			logger.Debug("enabling CSRF prevention")
+			exempt := crossOriginExemptPatterns(cfg)
+			if options.webhooks != nil {
+				exempt = append(exempt, webhookCrossOriginExemptPattern)
+			}
+			r.Use(crossOriginProtection(logger, cfg.Authentication.Session.CSRF.TrustedOrigins, exempt))
+		}
+
+		// incoming SCM webhooks are plain HTTP handlers outside Flipt
+		// authentication: each request is authenticated by its SCM signature
+		// or token against the environment's configured webhook secret.
+		if options.webhooks != nil {
+			r.Post(webhookPathPattern, func(w http.ResponseWriter, r *http.Request) {
+				options.webhooks.ServeWebhook(w, r, chi.URLParam(r, "environment"))
+			})
+		}
+
+		r.Mount("/api/v1", api)
+		r.Mount("/evaluate/v1", evaluateAPI)
+
+		// OFREP stream alias: must be registered before the /ofrep mount so the
+		// specific route takes precedence over the OFREP gateway catch-all.
+		r.Get("/ofrep/v1/_stream/{environmentKey}/{namespaceKey}/events", ofrepStreamHandler(clientEvaluationAPI))
+
+		r.Mount("/ofrep", ofrepAPI)
+		r.Mount("/internal/v1", clientEvaluationAPI) // for backwards compatibility
+
+		r.Mount("/internal/v2/analytics", analyticsAPI)
+		r.Mount("/api/v2/environments", environmentsAPI)
+		r.Mount("/client/v2", clientEvaluationAPI)
+
+		// mount all authentication related HTTP components
+		// to the chi router.
+		authenticationHTTPMount(ctx, logger, cfg.Authentication, r, conn)
+
+		r.Group(func(r chi.Router) {
+			// mount the metadata service to the chi router under /meta.
+			r.Mount("/meta", runtime.NewServeMux(
+				register(
+					ctx,
+					meta.NewMetadataServiceClient(conn),
+					meta.RegisterMetadataServiceHandlerClient,
+				),
+				runtime.WithMetadata(method.ForwardPrefix),
+			))
+		})
+	})
+
+	// mount health endpoint to use the grpc health check service
+	r.Mount("/health", runtime.NewServeMux(runtime.WithHealthEndpointAt(grpc_health_v1.NewHealthClient(conn), "/health")))
+
+	if cfg.UI.Enabled {
+		err := mountUI(r, logger)
+		if err != nil {
+			return nil, fmt.Errorf("mounting ui: %w", err)
+		}
+	}
+
+	server.Server = &http.Server{
+		Addr:           fmt.Sprintf("%s:%d", cfg.Server.Host, httpPort),
+		Handler:        r,
+		ReadTimeout:    cfg.Server.HTTPReadTimeout,
+		IdleTimeout:    cfg.Server.HTTPIdleTimeout,
+		MaxHeaderBytes: 1 << 20,
+	}
+
+	logger.Info("starting http server", zap.String("address", fmt.Sprintf("%s:%d", cfg.Server.Host, httpPort)))
+
+	if cfg.Server.Protocol != config.HTTPS {
+		server.listenAndServe = server.ListenAndServe
+		return server, nil
+	}
+
+	server.TLSConfig = &tls.Config{
+		MinVersion:               tls.VersionTLS12,
+		PreferServerCipherSuites: true,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		},
+	}
+
+	server.listenAndServe = func() error {
+		return server.ListenAndServeTLS(cfg.Server.CertFile, cfg.Server.CertKey)
+	}
+
+	return server, nil
+}
+
+// mountUI configures the chi mux to serve the embedded UI filesystem at the
+// root path, applying security headers and request path validation.
+func mountUI(r *chi.Mux, logger *zap.Logger) error {
+	fs, err := ui.FS()
+	if err != nil {
+		return err
+	}
+	r.With(validateRequestPath(logger), func(next http.Handler) http.Handler {
+		// set additional headers enabling the UI to be served securely
+		// ie: Content-Security-Policy, X-Content-Type-Options, etc.
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			for k, v := range ui.AdditionalHeaders() {
+				w.Header().Set(k, v)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}).Mount("/", http.FileServer(http.FS(fs)))
+	return nil
+}
+
+const (
+	// evaluationCrossOriginExemptPattern exempts browser cross-origin POSTs to
+	// the v1 evaluation API from cross-origin protection. It only takes effect
+	// when authentication is explicitly excluded for evaluation, in which case
+	// the endpoints are already open to anonymous access.
+	evaluationCrossOriginExemptPattern = "POST /evaluate/v1/"
+	// ofrepCrossOriginExemptPattern exempts browser cross-origin POSTs to the
+	// OFREP API from cross-origin protection under the same conditions.
+	ofrepCrossOriginExemptPattern = "POST /ofrep/v1/"
+)
+
+// crossOriginExemptPatterns returns the cross-origin protection exempt
+// patterns for the APIs explicitly excluded from authentication.
+// Exempted endpoints carry no ambient authority beyond what any anonymous
+// client can do, so rejecting cross-origin browser requests to them provides
+// no CSRF benefit while breaking browser-based evaluation behind externally
+// managed origins.
+func crossOriginExemptPatterns(cfg *config.Config) []string {
+	var patterns []string
+	if cfg.Authentication.Exclude.Evaluation {
+		patterns = append(patterns, evaluationCrossOriginExemptPattern)
+	}
+	if cfg.Authentication.Exclude.OFREP {
+		patterns = append(patterns, ofrepCrossOriginExemptPattern)
+	}
+	return patterns
+}
+
+func crossOriginProtection(logger *zap.Logger, trustedOrigins []string, exemptPatterns []string) func(http.Handler) http.Handler {
+	csrf := http.NewCrossOriginProtection()
+	for _, origin := range trustedOrigins {
+		if err := csrf.AddTrustedOrigin(origin); err != nil {
+			logger.Error("failed to add trusted origin for CSRF", zap.String("origin", origin), zap.Error(err))
+		}
+	}
+	for _, pattern := range exemptPatterns {
+		csrf.AddInsecureBypassPattern(pattern)
+		logger.Debug("exempting path from cross-origin protection", zap.String("pattern", pattern))
+	}
+	return csrf.Handler
+}
+
+// Run starts listening and serving the Flipt HTTP API.
+// It blocks until the server is shutdown.
+func (h *HTTPServer) Run() error {
+	if err := h.listenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("http server: %w", err)
+	}
+
+	return nil
+}
+
+// Shutdown triggers the shutdown operation of the HTTP API.
+func (h *HTTPServer) Shutdown(ctx context.Context) error {
+	h.logger.Info("shutting down HTTP server...")
+
+	err := h.Server.Shutdown(ctx)
+
+	// no webhook is being served now, so no new fetch can be scheduled: let
+	// the fetches already running or accepted complete, cancelling them if
+	// ctx expires first. This runs before the gRPC server shuts down the
+	// storage they fetch into.
+	if h.webhooks != nil {
+		if err := h.webhooks.Shutdown(ctx); err != nil {
+			h.logger.Warn("webhook-triggered fetches cancelled at shutdown", zap.Error(err))
+		}
+	}
+
+	return err
+}
+
+func removeTrailingSlash(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.URL.Path = strings.TrimSuffix(r.URL.Path, "/")
+		h.ServeHTTP(w, r)
+	})
+}
+
+// validateRequestPath is HTTP middleware that rejects requests whose URL path
+// is not valid UTF-8 once percent-decoded.
+//
+// A path that cannot be decoded as valid UTF-8 is malformed client input and
+// should produce a 4xx response. Without this guard such requests reach the
+// static file server, whose underlying fs.FS rejects invalid UTF-8 names with
+// a non-"not found" error that net/http maps to a 500 Internal Server Error,
+// with no log output at any level.
+//
+// Returning 400 here keeps malformed input in the correct status class and
+// emits a debug log line so the behavior is observable.
+func validateRequestPath(logger *zap.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !utf8.ValidString(r.URL.Path) {
+				if logger.Core().Enabled(zap.DebugLevel) {
+					// Log the percent-encoded form so we never emit raw invalid
+					// bytes into structured log output.
+					logger.Debug(
+						"rejecting request with invalid UTF-8 path",
+						zap.String("method", r.Method),
+						zap.String("path", r.URL.EscapedPath()),
+					)
+				}
+				http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// ofrepStreamHandler returns an http.HandlerFunc that rewrites OFREP stream
+// requests to the existing client evaluation stream endpoint.
+//
+// Only SSE (text/event-stream) requests are accepted; all others receive 406.
+// An internal context marker is set so the downstream gateway metadata callback
+// can forward it as gRPC metadata, conditionally skipping authentication
+// when authentication.exclude.ofrep is enabled.
+func ofrepStreamHandler(next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Only accept SSE (text/event-stream) requests for the stream endpoint.
+		if !strings.HasPrefix(r.Header.Get("Accept"), "text/event-stream") {
+			http.Error(w, "text/event-stream is the only supported content type for this endpoint", http.StatusNotAcceptable)
+			return
+		}
+
+		// Set context marker to identify this as an OFREP stream alias request.
+		r = r.WithContext(common.WithOFREPStream(r.Context()))
+
+		// Override Accept to text/event-stream so grpc-gateway selects the
+		// eventSourceMarshaler instead of the wildcard JSON marshaler,
+		// preventing full snapshot proto responses.
+		r.Header.Set("Accept", "text/event-stream")
+
+		environmentKey := chi.URLParam(r, "environmentKey")
+		namespaceKey := chi.URLParam(r, "namespaceKey")
+
+		r.URL.Path = fmt.Sprintf("/client/v2/environments/%s/namespaces/%s/stream", environmentKey, namespaceKey)
+
+		next.ServeHTTP(w, r)
+	}
+}

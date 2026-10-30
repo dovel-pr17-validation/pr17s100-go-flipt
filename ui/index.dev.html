@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en" class="bg-background h-full w-auto">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Flipt</title>
+
+    <script type="module">
+      import {injectIntoGlobalHook} from 'http://localhost:5173/@react-refresh';
+      injectIntoGlobalHook(window);
+      window.$RefreshReg$ = () => {};
+      window.$RefreshSig$ = () => (type) => type;
+    </script>
+    <script type="module" src="http://localhost:5173/@vite/client"></script>
+  </head>
+
+  <body class="h-full antialiased">
+    <div id="root">
+      <div class="container mx-auto my-10 max-w-7xl px-4 sm:px-6 lg:px-0">
+        <div class="mx-auto max-w-3xl">
+          <div class="bg-white px-6 pt-24 sm:pt-20 lg:px-8">
+            <div class="mx-auto max-w-2xl text-center">
+              <p class="mt-20 text-lg leading-8 text-gray-700">
+                Run the following in another terminal:
+              </p>
+            </div>
+          </div>
+          <div
+            class="mx-auto my-8 max-w-md overflow-hidden rounded-lg bg-gray-700 text-white"
+          >
+            <div class="px-4 py-5 sm:p-6">
+              <pre><span class="text-violet-300">$</span>&nbsp;mise run ui:dev</pre>
+            </div>
+          </div>
+      </div>
+    </div>
+    <script type="module" src="http://localhost:5173/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,266 @@
+import { PayloadAction, createSlice } from '@reduxjs/toolkit';
+import { createApi } from '@reduxjs/toolkit/query/react';
+import { SortingState } from '@tanstack/react-table';
+
+import { IConstraint } from '~/types/Constraint';
+import { INamespaceList } from '~/types/Namespace';
+import { IResourceListResponse, IResourceResponse } from '~/types/Resource';
+import { ISegment, ISegmentList } from '~/types/Segment';
+
+import { RootState } from '~/store';
+import { baseQuery } from '~/utils/redux-rtk';
+import { uuid } from '~/utils/uuid';
+
+const initialTableState: {
+  sorting: SortingState;
+} = {
+  sorting: []
+};
+
+export const segmentsTableSlice = createSlice({
+  name: 'segmentsTable',
+  initialState: initialTableState,
+  reducers: {
+    setSorting: (state, action: PayloadAction<SortingState>) => {
+      const newSorting = action.payload;
+      state.sorting = newSorting;
+    }
+  }
+});
+
+export const selectSorting = (state: RootState) => state.segmentsTable.sorting;
+export const { setSorting } = segmentsTableSlice.actions;
+
+export const segmentsApi = createApi({
+  reducerPath: 'segments',
+  baseQuery,
+  tagTypes: ['Segment'],
+  endpoints: (builder) => ({
+    // get list of segments in this namespace
+    listSegments: builder.query<
+      ISegmentList,
+      { environmentKey: string; namespaceKey: string }
+    >({
+      query: ({ environmentKey, namespaceKey }) =>
+        `/${environmentKey}/namespaces/${namespaceKey}/resources/flipt.core.Segment`,
+      providesTags: (result, _error, { environmentKey, namespaceKey }) =>
+        result
+          ? [
+              ...result.segments.map(({ key }) => ({
+                type: 'Segment' as const,
+                id: environmentKey + '/' + namespaceKey + '/' + key
+              })),
+              { type: 'Segment', id: environmentKey + '/' + namespaceKey }
+            ]
+          : [{ type: 'Segment', id: environmentKey + '/' + namespaceKey }],
+      transformResponse: (
+        response: IResourceListResponse<ISegment>
+      ): ISegmentList => {
+        return {
+          segments: response.resources.map(({ payload }) => payload)
+        } as ISegmentList;
+      }
+    }),
+    // get segment in this namespace
+    getSegment: builder.query<
+      ISegment,
+      { environmentKey: string; namespaceKey: string; segmentKey: string }
+    >({
+      query: ({ environmentKey, namespaceKey, segmentKey }) =>
+        `/${environmentKey}/namespaces/${namespaceKey}/resources/flipt.core.Segment/${segmentKey}`,
+      providesTags: (
+        _result,
+        _error,
+        { environmentKey, namespaceKey, segmentKey }
+      ) => [
+        {
+          type: 'Segment',
+          id: environmentKey + '/' + namespaceKey + '/' + segmentKey
+        },
+        { type: 'Segment', id: environmentKey + '/' + namespaceKey }
+      ],
+      transformResponse: (response: IResourceResponse<ISegment>): ISegment => {
+        return {
+          ...response.resource.payload,
+          constraints: response.resource.payload.constraints?.map(
+            (c: IConstraint) => ({
+              ...c,
+              id: uuid()
+            })
+          )
+        };
+      }
+    }),
+    // create a new segment in the namespace
+    createSegment: builder.mutation<
+      ISegment,
+      {
+        environmentKey: string;
+        namespaceKey: string;
+        values: ISegment;
+        revision?: string;
+      }
+    >({
+      query({ environmentKey, namespaceKey, values, revision }) {
+        return {
+          url: `/${environmentKey}/namespaces/${namespaceKey}/resources`,
+          method: 'POST',
+          body: {
+            key: values.key,
+            revision: revision,
+            payload: {
+              '@type': 'flipt.core.Segment',
+              ...values
+            }
+          }
+        };
+      },
+      invalidatesTags: (
+        _result,
+        _error,
+        { environmentKey, namespaceKey, values }
+      ) => [
+        { type: 'Segment', id: environmentKey + '/' + namespaceKey },
+        {
+          type: 'Segment',
+          id: environmentKey + '/' + namespaceKey + '/' + values.key
+        }
+      ]
+    }),
+    // delete the segment from the namespace
+    deleteSegment: builder.mutation<
+      void,
+      {
+        environmentKey: string;
+        namespaceKey: string;
+        segmentKey: string;
+        revision: string;
+      }
+    >({
+      query({ environmentKey, namespaceKey, segmentKey, revision }) {
+        return {
+          url: `/${environmentKey}/namespaces/${namespaceKey}/resources/flipt.core.Segment/${segmentKey}?revision=${revision}`,
+          method: 'DELETE'
+        };
+      },
+      invalidatesTags: (
+        _result,
+        _error,
+        { environmentKey, namespaceKey, segmentKey }
+      ) => [
+        { type: 'Segment', id: environmentKey + '/' + namespaceKey },
+        {
+          type: 'Segment',
+          id: environmentKey + '/' + namespaceKey + '/' + segmentKey
+        }
+      ]
+    }),
+    // update the segment in the namespace
+    updateSegment: builder.mutation<
+      ISegment,
+      {
+        environmentKey: string;
+        namespaceKey: string;
+        segmentKey: string;
+        values: ISegment;
+        revision: string;
+      }
+    >({
+      query({ environmentKey, namespaceKey, segmentKey, values, revision }) {
+        const payload = {
+          '@type': 'flipt.core.Segment',
+          ...values
+        };
+        return {
+          url: `/${environmentKey}/namespaces/${namespaceKey}/resources`,
+          method: 'PUT',
+          body: {
+            key: segmentKey,
+            revision,
+            payload
+          }
+        };
+      },
+      invalidatesTags: (
+        _result,
+        _error,
+        { environmentKey, namespaceKey, segmentKey }
+      ) => [
+        { type: 'Segment', id: environmentKey + '/' + namespaceKey },
+        {
+          type: 'Segment',
+          id: environmentKey + '/' + namespaceKey + '/' + segmentKey
+        }
+      ]
+    }),
+    // copy the segment to another environment and/or namespace
+    copySegment: builder.mutation<
+      void,
+      {
+        from: {
+          environmentKey: string;
+          namespaceKey: string;
+          segmentKey: string;
+        };
+        to: {
+          environmentKey: string;
+          namespaceKey: string;
+          segmentKey: string;
+        };
+      }
+    >({
+      queryFn: async ({ from, to }, _api, _extraOptions, baseQuery) => {
+        let resp = await baseQuery({
+          url: `/${from.environmentKey}/namespaces/${from.namespaceKey}/resources/flipt.core.Segment/${from.segmentKey}`,
+          method: 'GET'
+        });
+        if (resp.error) {
+          return { error: resp.error };
+        }
+
+        const res = resp.data as {
+          resource: { payload: ISegment; key: string };
+          revision: string;
+        };
+
+        resp = await baseQuery({
+          url: `/${to.environmentKey}/namespaces`,
+          method: 'GET'
+        });
+        if (resp.error) {
+          return { error: resp.error };
+        }
+
+        const destination = resp.data as INamespaceList;
+
+        const data = {
+          key: res.resource.key,
+          payload: res.resource.payload,
+          revision: destination.revision
+        };
+
+        resp = await baseQuery({
+          url: `/${to.environmentKey}/namespaces/${to.namespaceKey}/resources`,
+          method: 'POST',
+          body: data
+        });
+        if (resp.error) {
+          return { error: resp.error };
+        }
+        return { data: undefined };
+      },
+      invalidatesTags: (_result, _error, { to }) => [
+        { type: 'Segment', id: to.environmentKey + '/' + to.namespaceKey }
+      ]
+    })
+  })
+});
+
+export const {
+  useListSegmentsQuery,
+  useGetSegmentQuery,
+  useCreateSegmentMutation,
+  useDeleteSegmentMutation,
+  useUpdateSegmentMutation,
+  useCopySegmentMutation
+} = segmentsApi;

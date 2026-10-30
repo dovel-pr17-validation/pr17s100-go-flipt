@@ -1,0 +1,422 @@
+package flipt
+
+import "strings"
+
+import "list"
+
+JsonPath: string
+
+#FliptSpec: {
+	// flipt-schema-v2
+	//
+	// Flipt config file is a YAML file defining how to configure the
+	// Flipt application.
+	@jsonschema(schema="http://json-schema.org/draft/2019-09/schema#")
+	version:         "2.0" | *"2.0"
+	experimental?:   #experimental
+	analytics?:      #analytics
+	authentication?: #authentication
+	authorization?:  #authorization
+	cors?:           #cors
+	diagnostics?:    #diagnostics
+	evaluation?:     #evaluation
+	environments?:   #environments
+	storage?:        #storage
+	templates?:      #templates
+	credentials?:    #credentials
+	log?:            #log
+	meta?:           #meta
+	server?:         #server
+	metrics?:        #metrics
+	tracing?:        #tracing
+	ui?:             #ui
+	license?:        #license
+	secrets?:        #secrets
+
+	#authentication: {
+		required?: bool | *false
+		exclude?: {
+			management: bool | *false
+			metadata:   bool | *false
+			evaluation: bool | *false
+			ofrep:      bool | *false
+		}
+
+		session?: {
+			domain?:        string
+			secure?:        bool
+			token_lifetime: =~#duration | *"24h"
+			state_lifetime: =~#duration | *"10m"
+			csrf?: {
+				key:    string
+				secure: bool
+				trusted_origins?: [...] | string | *[]
+			}
+			storage?: {
+				type: *"memory" | "redis"
+				cleanup?: {
+					grace_period?: =~#duration | int | *"30m"
+				}
+				redis?: {
+					host?:               string | *"localhost"
+					port?:               int | *6379
+					require_tls?:        bool | *false
+					db?:                 int | *0
+					username?:           string
+					password?:           string
+					pool_size?:          int | *0
+					min_idle_conn?:      int | *0
+					conn_max_idle_time?: =~#duration | int | *0
+					net_timeout?:        =~#duration | int | *0
+					ca_cert_path?:       string
+					ca_cert_bytes?:      string
+					insecure_skip_tls?:  bool | *false
+					mode?:               *"single" | "cluster"
+					prefix?:             string | *"flipt"
+				}
+			}
+		}
+
+		methods?: {
+			token?: {
+				enabled?: bool | *false
+				storage?: {
+					type: string | *"static"
+					tokens: [string]: {
+						credential: string
+						metadata: [string]: string
+					}
+				}
+			}
+
+			oidc?: {
+				enabled?: bool | *false
+				providers?: {
+					{[=~"^.*$" & !~"^()$"]: #authentication.#authentication_oidc_provider}
+				}
+				email_matches?: [...] | string
+				cache_ttl?: =~#duration | *"15m"
+			}
+
+			kubernetes?: {
+				enabled?:                   bool | *false
+				discovery_url:              string
+				ca_path:                    string
+				service_account_token_path: string
+				audiences?: [...string]
+			}
+
+			github?: {
+				enabled?:          bool | *false
+				server_url?:       string
+				api_url?:          string
+				client_secret?:    string
+				client_id?:        string
+				redirect_address?: string
+				scopes?: [...string]
+				allowed_organizations?: [...] | string
+				allowed_teams?: [string]: [...string]
+				use_pkce?: bool
+			}
+
+			jwt?: {
+				enabled?: bool | *false
+				validate_claims?: {
+					issuer?:  string
+					subject?: string
+					audiences?: [...string]
+				}
+				claims_mapping?: {
+					email?:   JsonPath
+					name?:    JsonPath
+					sub?:     JsonPath
+					picture?: JsonPath
+					role?:    JsonPath
+				}
+				jwks_url?:        string
+				public_key_file?: string
+			}
+		}
+
+		#authentication_oidc_provider: {
+			@jsonschema(id="authentication_oidc_provider")
+			issuer_url?:       string
+			discovery_url?:    string
+			client_id?:        string
+			client_secret?:    string
+			redirect_address?: string
+			nonce?:            string
+			scopes?: [...string]
+			use_pkce?: bool
+			use_end_session_endpoint?: bool
+			algorithms?: [...("RS256" | "RS384" | "RS512" | "ES256" | "ES384" | "ES512" | "PS256" | "PS384" | "PS512")] | *["RS256"]
+			fetch_extra_user_info?: bool
+			allow_front_channel_logout?:  bool
+			authorize_parameters?:       [string]: string
+			claims_mapping?: [string]: string
+		}
+
+	}
+
+	#authorization: {
+		required?: bool | *false
+		backend:   "local" | "bundle" | *""
+		exclude?: {
+			evaluation: bool | *true
+			ofrep:      bool | *true
+		}
+		local?: {
+			policy?: {
+				poll_interval: =~#duration | *"5m"
+				path:          string
+			}
+			data?: {
+				poll_interval: =~#duration | *"5m"
+				path:          string
+			}
+		}
+		bundle?: {
+			configuration: string
+		}
+	}
+
+	#cors: {
+		enabled?: bool | *false
+		allowed_origins?: [...] | string | *["*"]
+		allowed_headers?: [...string] | string | *[
+			"Accept",
+			"Authorization",
+			"Content-Type",
+			"X-CSRF-Token",
+			"X-Flipt-Accept-Server-Version",
+			"X-Flipt-Environment",
+			"X-Flipt-Namespace",
+			"If-None-Match",
+		]
+	}
+
+	#diagnostics: {
+		profiling?: {
+			enabled?: bool | *false
+		}
+	}
+
+	#scm: {
+		type:        *"github" | "gitea" | "gitlab" | "azure" | "bitbucket"
+		credentials?: string
+		api_url?:    string
+		webhook?: {
+			secret: string
+		}
+	}
+
+	#evaluation: {
+		include_flag_metadata?: bool | *false
+	}
+
+	#environments: [string]: {
+		name:      string
+		default:   bool | *false
+		storage:   string
+		directory: string | *""
+		scm?:      #scm
+	}
+
+	#storage: [string]: {
+		remote?:       string
+		fetch_policy?: *"strict" | "lenient"
+		backend?: {
+			type:  *"memory" | "local"
+			path?: string
+		}
+		branch?:            string | *"main"
+		poll_interval?:     =~#duration | *"30s"
+		ca_cert_path?:      string
+		ca_cert_bytes?:     string
+		insecure_skip_tls?: bool | *false
+		credentials?:       string
+		signature?: {
+			name?:    string
+			email?:   string
+			enabled?: bool | *false
+			type?:    string | *"gpg"
+			key_ref?: {
+				provider: string
+				path:     string
+				key:      string
+			}
+			key_id?: string
+		}
+	}
+
+	// Server-wide custom templates for commit messages and pull requests.
+	// These override built-in defaults but can be overridden by repository-level templates.
+	#templates: {
+		commit_message?: string
+		proposal_title?: string
+		proposal_body?:  string
+	}
+
+	#credentials: [string]: {
+		type: "basic"
+		basic: {
+			username: string
+			password: string
+		}
+	} | {
+		type: "ssh"
+		ssh: {
+			user?:                     string
+			password:                  string
+			private_key_bytes:         string
+			insecure_ignore_host_key?: bool
+		} | {
+			user?:                     string
+			password:                  string
+			private_key_path:          string
+			insecure_ignore_host_key?: bool
+		}
+	} | {
+		type:         "access_token"
+		access_token: string
+	} | {
+		type: "github_app"
+		github_app: {
+			client_id:        string
+			installation_id:  int | string
+			private_key_path: string
+			api_url?:         string
+		} | {
+			client_id:         string
+			installation_id:   int | string
+			private_key_bytes: string
+			api_url?:          string
+		}
+	}
+
+	_#lower: ["debug", "error", "fatal", "info", "panic", "warn"]
+	_#all: list.Concat([_#lower, [for x in _#lower {strings.ToUpper(x)}]])
+	#log: {
+		file?:       string
+		encoding?:   *"console" | "json"
+		level?:      #log.#log_level
+		grpc_level?: #log.#log_level
+		keys?: {
+			time?:    string | *"T"
+			level?:   string | *"L"
+			message?: string | *"M"
+		}
+
+		#log_level: or(_#all)
+	}
+
+	#meta: {
+		check_for_updates?: bool | *true
+		telemetry_enabled?: bool | *true
+		state_directory?:   string | *"$HOME/.config/flipt"
+	}
+
+	#server: {
+		protocol?:                *"http" | "https"
+		host?:                    string | *"0.0.0.0"
+		https_port?:              int | *443
+		http_port?:               int | *8080
+		grpc_port?:               int | *9000
+		cert_file?:               string
+		cert_key?:                string
+		http_read_timeout?:       =~#duration | *"10s"
+		http_idle_timeout?:       =~#duration | *"0s"
+		grpc_conn_max_idle_time?: =~#duration
+		grpc_conn_max_age?:       =~#duration
+		grpc_conn_max_age_grace?: =~#duration
+	}
+
+	#metrics: {
+		enabled?:  bool | *true
+		exporter?: *"prometheus" | "otlp"
+	}
+
+	#tracing: {
+		enabled?: bool | *false
+	}
+
+	#ui: {
+		enabled?:       bool | *true
+		default_theme?: "light" | "dark" | *"system"
+		topbar?: {
+			color?: string
+			label?: string
+		}
+	}
+
+	#license: {
+		key?:        string
+		file?:       string
+		machine_id?: string
+	}
+
+	#secrets: {
+		providers?: {
+			file?: {
+				enabled?:   bool | *false
+				base_path?: string | *"/etc/flipt/secrets"
+			} | null
+			vault?: {
+				enabled?:     bool | *false
+				address?:     string
+				auth_method?: string | *"token"
+				role?:        string
+				mount?:       string | *"secret"
+				token?:       string
+				namespace?:   string
+			} | null
+			gcp?: {
+				enabled?:     bool | *false
+				project?:     string
+				location?:    string
+				credentials?: string
+			} | null
+			aws?: {
+				enabled?:      bool | *false
+				endpoint_url?: string
+			} | null
+			azure?: {
+				enabled?:   bool | *false
+				vault_url?: string
+			} | null
+		}
+	}
+
+	#analytics: {
+		storage?: {
+			clickhouse?: {
+				enabled?: bool | *false
+				url?:     string | *""
+			}
+			prometheus?: {
+				enabled?: bool | *false
+				url?:     string | *""
+				headers?: [string]: string
+				sigv4?: {
+					enabled?:               bool | *false
+					region?:                string
+					access_key?:            string
+					secret_key?:            string
+					profile?:               string
+					role_arn?:              string
+					external_id?:           string
+					use_fips_sts_endpoint?: bool | *false
+					service_name?:          string
+				}
+			}
+		}
+		buffer?: {
+			capacity?:     int
+			flush_period?: string | *"2m"
+		}
+	}
+
+	#experimental: {}
+
+	#duration: "^([0-9]+(ns|us|µs|ms|s|m|h))+$"
+}
